@@ -1,0 +1,188 @@
+name: KernelSU Next Reference Patch Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit reference patches without changing kernel source
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout OnePlus 5 kernel
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-22.2
+          fetch-depth: 0
+
+      - name: Checkout reference repository
+        uses: actions/checkout@v4
+        with:
+          repository: TosteRino/joan-kernelsu
+          ref: main
+          path: reference
+
+      - name: Verify reference files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for file in \
+            reference/prepare-source.sh \
+            reference/patches/kernelsu-next-linux-4.4-compat.diff \
+            reference/patches/manual-hooks-linux-4.4.diff \
+            reference/patches/post-kernelsu.diff
+          do
+            test -s "$file"
+            echo "FOUND: $file"
+            sha256sum "$file"
+          done
+
+      - name: Inspect reference preparation script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== prepare-source.sh ====="
+          cat reference/prepare-source.sh
+
+      - name: Inspect patch target paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for patch in \
+            reference/patches/kernelsu-next-linux-4.4-compat.diff \
+            reference/patches/manual-hooks-linux-4.4.diff \
+            reference/patches/post-kernelsu.diff
+          do
+            echo
+            echo "===== $patch ====="
+            grep -E '^(diff --git|--- |\+\+\+ )' "$patch" || true
+          done
+
+      - name: Integrate reference KernelSU Next revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fLSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s legacy
+
+          test -d KernelSU-Next
+
+          cd KernelSU-Next
+
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow origin legacy
+          fi
+
+          if ! git cat-file -e 'a54e4fa4^{commit}' 2>/dev/null; then
+            git fetch origin legacy
+          fi
+
+          git cat-file -e 'a54e4fa4^{commit}'
+
+          git checkout --detach a54e4fa4
+
+          echo "===== KernelSU Next revision ====="
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Test compatibility patch in KernelSU Next
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="$GITHUB_WORKSPACE/reference/patches/kernelsu-next-linux-4.4-compat.diff"
+
+          echo "Testing compatibility patch inside KernelSU-Next..."
+
+          git -C KernelSU-Next apply --check "$PATCH"
+
+          echo "PASS: compatibility patch targets KernelSU Next."
+
+      - name: Test manual hooks in kernel source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="$GITHUB_WORKSPACE/reference/patches/manual-hooks-linux-4.4.diff"
+
+          echo "Testing manual hooks against the OnePlus kernel..."
+
+          git apply --check "$PATCH"
+
+          echo "PASS: manual hooks target the kernel source."
+
+      - name: Locate post-KernelSU patch target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="$GITHUB_WORKSPACE/reference/patches/post-kernelsu.diff"
+          FOUND=0
+
+          echo "Testing post-KernelSU patch against kernel source..."
+
+          if git apply --check "$PATCH" 2>&1; then
+            echo "PASS: post-KernelSU patch applies to kernel source."
+            FOUND=1
+          else
+            echo "Does not apply to kernel root."
+          fi
+
+          echo
+          echo "Testing post-KernelSU patch against KernelSU Next..."
+
+          if git -C KernelSU-Next apply --check "$PATCH" 2>&1; then
+            echo "PASS: post-KernelSU patch applies to KernelSU Next."
+            FOUND=1
+          else
+            echo "Does not apply to KernelSU Next root."
+          fi
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::Post-KernelSU patch did not apply cleanly in either candidate directory."
+            exit 1
+          fi
+
+      - name: Create audit report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "KernelSU Next reference patch audit"
+            echo
+            echo "Kernel branch: lineage-22.2"
+            echo "Reference revision:"
+            git -C reference rev-parse HEAD 2>/dev/null || true
+            echo
+            echo "KernelSU Next revision:"
+            git -C KernelSU-Next rev-parse HEAD 2>/dev/null || true
+            echo
+            echo "Patch target paths:"
+            for patch in \
+              reference/patches/kernelsu-next-linux-4.4-compat.diff \
+              reference/patches/manual-hooks-linux-4.4.diff \
+              reference/patches/post-kernelsu.diff
+            do
+              echo
+              echo "===== $patch ====="
+              grep -E '^(diff --git|--- |\+\+\+ )' "$patch" 2>/dev/null || true
+            done
+            echo
+            echo "Kernel source was not committed or pushed."
+          } > reference-patch-audit-report.txt
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-next-reference-patch-audit
+          path: reference-patch-audit-report.txt
+          if-no-files-found: warn
