@@ -19,7 +19,7 @@ jobs:
           ref: lineage-22.2
           fetch-depth: 0
 
-      - name: Verify kernel source
+      - name: Verify kernel source and manual hooks
         run: |
           set -uo pipefail
 
@@ -51,10 +51,17 @@ jobs:
 
           check_file Makefile
           check_file arch/arm64/configs/lineage_oneplus5_defconfig
-          check_file reference/patches/kernelsu-next-linux-4.4-compat.diff
-          check_file reference/patches/manual-hooks-linux-4.4.diff
+          check_file fs/exec.c
+          check_file fs/open.c
+          check_file fs/read_write.c
+          check_file fs/stat.c
+          check_file fs/internal.h
+          check_file fs/namespace.c
           check_file kernel/reboot.c
+          check_file kernel/sys.c
+          check_file security/selinux/hooks.c
           check_file security/selinux/include/objsec.h
+          check_file include/linux/kernelsu.h
 
           echo
           echo "Checking integration commit..."
@@ -74,10 +81,32 @@ jobs:
           fi
 
           echo
-          echo "Checking existing kernel integration..."
+          echo "Checking manual hook includes..."
 
+          check_text '#include <linux/kernelsu.h>' fs/exec.c
+          check_text '#include <linux/kernelsu.h>' fs/open.c
+          check_text '#include <linux/kernelsu.h>' fs/read_write.c
+          check_text '#include <linux/kernelsu.h>' fs/stat.c
+          check_text '#include <linux/kernelsu.h>' kernel/reboot.c
+          check_text '#include <linux/kernelsu.h>' kernel/sys.c
+
+          echo
+          echo "Checking manual hook calls..."
+
+          check_text 'ksu_handle_execveat' fs/exec.c
+          check_text 'ksu_handle_faccessat' fs/open.c
+          check_text 'ksu_handle_vfs_read' fs/read_write.c
+          check_text 'ksu_handle_stat' fs/stat.c
+          check_text 'ksu_handle_newfstat_ret' fs/stat.c
+          check_text 'ksu_handle_fstat64_ret' fs/stat.c
           check_text 'ksu_handle_sys_reboot' kernel/reboot.c
-          check_text 'selinux_inode' security/selinux/include/objsec.h
+          check_text 'ksu_handle_setresuid' kernel/sys.c
+
+          echo
+          echo "Checking SELinux integration..."
+
+          check_text 'is_ksu_transition' security/selinux/hooks.c
+          check_text 'selinux_inode(const struct inode *inode)' security/selinux/include/objsec.h
 
           echo
           echo "===== Diagnostic result ====="
@@ -87,7 +116,7 @@ jobs:
             exit 1
           fi
 
-          echo "RESULT: All kernel source checks passed."
+          echo "RESULT: All kernel source and manual hook checks passed."
 
       - name: Install build dependencies
         run: |
@@ -106,6 +135,7 @@ jobs:
             lz4 \
             python3 \
             rsync \
+            tar \
             unzip \
             zip \
             zlib1g-dev
@@ -167,38 +197,41 @@ jobs:
           aarch64-linux-android-gcc --version
           arm-linux-androideabi-gcc --version
 
-      - name: Download and pin KernelSU Next legacy source
+      - name: Download and pin KernelSU Next source
         run: |
           set -euo pipefail
 
-          KSU_COMMIT="a54e4fa4"
+          KSU_COMMIT="a54e4fa46c6cc25bcaa055cf14d790194beffed8"
+          KSU_ARCHIVE="${RUNNER_TEMP}/kernelsu-next-${KSU_COMMIT}.tar.gz"
 
-          echo "Cloning KernelSU Next legacy branch..."
+          echo "Downloading exact KernelSU Next commit:"
+          echo "$KSU_COMMIT"
 
           rm -rf KernelSU-Next
+          mkdir -p KernelSU-Next
 
-          git clone \
-            --branch legacy \
-            --single-branch \
-            https://github.com/KernelSU-Next/KernelSU-Next.git \
-            KernelSU-Next
+          curl -fL --retry 3 \
+            "https://github.com/KernelSU-Next/KernelSU-Next/archive/${KSU_COMMIT}.tar.gz" \
+            -o "$KSU_ARCHIVE"
 
-          echo "Checking pinned commit..."
+          tar -tzf "$KSU_ARCHIVE" > "${RUNNER_TEMP}/ksu-archive-list.txt"
+          test -s "${RUNNER_TEMP}/ksu-archive-list.txt"
 
-          git -C KernelSU-Next cat-file -e "${KSU_COMMIT}^{commit}"
-          git -C KernelSU-Next checkout --detach "${KSU_COMMIT}"
+          tar -xzf "$KSU_ARCHIVE" \
+            --strip-components=1 \
+            -C KernelSU-Next
 
-          ACTUAL_COMMIT="$(git -C KernelSU-Next rev-parse --short=8 HEAD)"
+          test -s KernelSU-Next/kernel/Kbuild
+          test -s KernelSU-Next/kernel/Kconfig
 
-          if [ "$ACTUAL_COMMIT" != "$KSU_COMMIT" ]; then
-            echo "ERROR: Expected ${KSU_COMMIT}, got ${ACTUAL_COMMIT}"
+          printf '%s\n' "$KSU_COMMIT" > KernelSU-Next/.source-commit
+
+          if [ -e drivers/kernelsu ] && [ ! -L drivers/kernelsu ]; then
+            echo "ERROR: drivers/kernelsu exists and is not a symlink."
             exit 1
           fi
 
-          test -f KernelSU-Next/kernel/Kbuild
-          test -f KernelSU-Next/kernel/Kconfig
-
-          rm -rf drivers/kernelsu
+          rm -f drivers/kernelsu
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
 
           grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
@@ -208,21 +241,82 @@ jobs:
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
           test -L drivers/kernelsu
-          test -f drivers/kernelsu/Kbuild
-          test -f drivers/kernelsu/Kconfig
+          test -s drivers/kernelsu/Kbuild
+          test -s drivers/kernelsu/Kconfig
 
-          echo "KernelSU Next ${ACTUAL_COMMIT} is installed and linked."
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
 
-      - name: Apply Linux 4.4 compatibility patch
+          echo "KernelSU Next source downloaded and linked."
+          echo "Pinned commit: $(cat KernelSU-Next/.source-commit)"
+
+      - name: Download and apply Linux 4.4 KernelSU compatibility patch
         run: |
           set -euo pipefail
 
-          PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
+          PATCH="${RUNNER_TEMP}/kernelsu-next-linux-4.4-compat.diff"
 
-          git -C KernelSU-Next apply --check "../${PATCH}"
-          git -C KernelSU-Next apply "../${PATCH}"
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/TosteRino/joan-kernelsu/main/patches/kernelsu-next-linux-4.4-compat.diff \
+            -o "$PATCH"
 
-          echo "KernelSU Next Linux 4.4 compatibility patch applied."
+          test -s "$PATCH"
+          grep -Fq 'ALIGN_DOWN' "$PATCH"
+          grep -Fq '__nocfi' "$PATCH"
+
+          git -C KernelSU-Next apply --check "$PATCH"
+          git -C KernelSU-Next apply "$PATCH"
+
+          grep -Fq 'ALIGN_DOWN' KernelSU-Next/kernel/compat/kernel_compat.h
+          grep -Fq '__nocfi' KernelSU-Next/kernel/compat/kernel_compat.h
+
+          echo "Linux 4.4 KernelSU compatibility patch applied and verified."
+
+      - name: Set KernelSU Next version metadata
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("drivers/kernelsu/Kbuild")
+          content = path.read_text()
+
+          replacements = (
+              (
+                  "KSU_VERSION_FALLBACK := 1",
+                  "KSU_VERSION_FALLBACK := 33193",
+              ),
+              (
+                  "KSU_VERSION_TAG_FALLBACK := v0.0.1",
+                  "KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14",
+              ),
+          )
+
+          for old, new in replacements:
+              if new in content:
+                  continue
+
+              if old not in content:
+                  raise SystemExit(
+                      f"Expected Kbuild line not found: {old}"
+                  )
+
+              content = content.replace(old, new, 1)
+
+          path.write_text(content)
+
+          updated = path.read_text()
+
+          if "KSU_VERSION_FALLBACK := 33193" not in updated:
+              raise SystemExit("KernelSU version fallback was not updated.")
+
+          if "KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14" not in updated:
+              raise SystemExit("KernelSU version tag fallback was not updated.")
+
+          print("KernelSU version fallback: 33193")
+          print("KernelSU version tag fallback: v3.2.0-legacy-14")
+          PY
 
       - name: Apply Linux 4.4 source compatibility fixes
         run: |
@@ -244,7 +338,7 @@ jobs:
           elif new_call not in source:
               raise SystemExit("Expected copy_to_iter() call was not found.")
 
-          # Backport path_umount() support for this Linux 4.4 kernel.
+          # Backport path_umount() support before kernel compilation.
           namespace = Path("fs/namespace.c")
           source = namespace.read_text()
 
@@ -312,7 +406,7 @@ jobs:
 
           namespace.write_text(source)
 
-          # Add the function declaration to fs/internal.h.
+          # Add the path_umount() declaration to fs/internal.h.
           internal = Path("fs/internal.h")
           source = internal.read_text()
 
@@ -333,7 +427,7 @@ jobs:
 
               internal.write_text(source)
 
-          # Verify the compatibility changes.
+          # Verify all compatibility changes.
           if new_call not in ksud.read_text():
               raise SystemExit("copy_to_iter() compatibility fix is missing.")
 
@@ -346,23 +440,43 @@ jobs:
           if declaration not in internal.read_text():
               raise SystemExit("path_umount() declaration is missing.")
 
-          print("Linux 4.4 compatibility fixes applied and verified.")
+          print("Linux 4.4 source compatibility fixes applied and verified.")
           PY
 
       - name: Verify KernelSU source and configuration
         run: |
           set -euo pipefail
 
-          test "$(git -C KernelSU-Next rev-parse --short=8 HEAD)" = "a54e4fa4"
+          test "$(cat KernelSU-Next/.source-commit)" = \
+            "a54e4fa46c6cc25bcaa055cf14d790194beffed8"
 
           test -L drivers/kernelsu
-          test -f drivers/kernelsu/Kbuild
-          test -f drivers/kernelsu/Kconfig
+          test -s drivers/kernelsu/Kbuild
+          test -s drivers/kernelsu/Kconfig
+
+          grep -Fq 'KSU_VERSION_FALLBACK := 33193' drivers/kernelsu/Kbuild
+          grep -Fq 'KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14' drivers/kernelsu/Kbuild
+
+          grep -Fq 'ALIGN_DOWN' drivers/kernelsu/compat/kernel_compat.h
+          grep -Fq '__nocfi' drivers/kernelsu/compat/kernel_compat.h
+
+          grep -Fq 'selinux_inode(const struct inode *inode)' security/selinux/include/objsec.h
+          grep -Fq 'is_ksu_transition' security/selinux/hooks.c
 
           grep -Fq 'ksu_handle_sys_reboot' kernel/reboot.c
-          grep -Fq 'selinux_inode' security/selinux/include/objsec.h
+          grep -Fq 'ksu_handle_execveat' fs/exec.c
+          grep -Fq 'ksu_handle_faccessat' fs/open.c
+          grep -Fq 'ksu_handle_vfs_read' fs/read_write.c
+          grep -Fq 'ksu_handle_stat' fs/stat.c
+          grep -Fq 'ksu_handle_newfstat_ret' fs/stat.c
+          grep -Fq 'ksu_handle_fstat64_ret' fs/stat.c
+          grep -Fq 'ksu_handle_setresuid' kernel/sys.c
 
-          echo "KernelSU source verification passed."
+          grep -Fq 'static int can_umount(' fs/namespace.c
+          grep -Fq 'int path_umount(struct path *path, int flags)' fs/namespace.c
+          grep -Fq 'int path_umount(struct path *path, int flags);' fs/internal.h
+
+          echo "KernelSU source, hooks, and compatibility checks passed."
 
       - name: Configure OnePlus 5 kernel
         run: |
@@ -375,7 +489,7 @@ jobs:
           grep -Fxq 'CONFIG_KSU_MANUAL_HOOK=y' out/.config
 
           if grep -Fxq 'CONFIG_KSU_KPROBES_HOOK=y' out/.config; then
-            echo "ERROR: Kprobes hook is enabled, manual hooks are required."
+            echo "ERROR: Kprobes hook is enabled. Manual hooks are required."
             exit 1
           fi
 
@@ -391,8 +505,6 @@ jobs:
             CROSS_COMPILE=aarch64-linux-android- \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 \
-            KSU_VERSION_OVERRIDE=33193 \
-            KSU_VERSION_TAG_OVERRIDE=v3.2.0-legacy-14 \
             Image.gz dtbs 2>&1 | tee kernel-build.log
 
           test -s out/arch/arm64/boot/Image.gz
@@ -400,8 +512,8 @@ jobs:
 
           compgen -G 'out/arch/arm64/boot/dts/qcom/*.dtb' > /dev/null
 
-          grep -Fq -- '-- KernelSU-Next version override: 33193' kernel-build.log
-          grep -Fq -- '-- KernelSU-Next tag: v3.2.0-legacy-14' kernel-build.log
+          grep -Fq -- '-- KernelSU-Next version fallback: 33193' kernel-build.log
+          grep -Fq -- '-- KernelSU-Next tag fallback: v3.2.0-legacy-14' kernel-build.log
 
           echo "Kernel image and device trees built successfully."
 
@@ -418,7 +530,7 @@ jobs:
             echo "Kernel version: 4.4.302"
             echo "Branch: lineage-22.2"
             echo "Integration commit: 8e7088d77725"
-            echo "KernelSU Next revision: a54e4fa4"
+            echo "KernelSU Next revision: a54e4fa46c6cc25bcaa055cf14d790194beffed8"
             echo "KernelSU Next version: v3.2.0-legacy-14"
             echo "KernelSU Next version code: 33193"
             echo "Defconfig: lineage_oneplus5_defconfig"
