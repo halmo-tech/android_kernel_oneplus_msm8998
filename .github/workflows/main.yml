@@ -47,23 +47,39 @@ jobs:
           grep -n kernelsu drivers/Kconfig
 
 
-      - name: Inspect KernelSU integration locations
+
+      - name: Inspect Linux 4.4 integration points
         run: |
           echo "=== KernelSU configuration ==="
           grep -nE 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES' \
             arch/arm64/configs/lineage_oneplus5_defconfig || true
 
+          echo "=== KernelSU hook options ==="
+          grep -nE 'KSU_MANUAL_HOOK|KSU_KPROBES_HOOK|config KSU' \
+            drivers/kernelsu/Kconfig || true
+
           echo "=== fs/exec.c ==="
-          sed -n '1665,1730p' fs/exec.c
+          sed -n '1520,1685p' fs/exec.c
 
           echo "=== fs/open.c ==="
-          sed -n '335,375p' fs/open.c
+          sed -n '340,420p' fs/open.c
 
-          echo "=== fs/read_write.c ==="
-          sed -n '425,470p' fs/read_write.c
+          echo "=== fs/read_write.c: vfs_read ==="
+          sed -n '430,470p' fs/read_write.c
+          echo "=== fs/read_write.c: read syscall ==="
+          sed -n '555,585p' fs/read_write.c
 
           echo "=== fs/stat.c ==="
-          sed -n '280,315p' fs/stat.c
+          sed -n '285,370p' fs/stat.c
+          sed -n '420,530p' fs/stat.c
+
+          echo "=== kernel/sys.c: setresuid ==="
+          grep -n -B8 -A45 'SYSCALL_DEFINE3(setresuid' \
+            kernel/sys.c || true
 
           echo "=== kernel/reboot.c ==="
-          sed -n '275,310p' kernel/reboot.c
+          sed -n '275,330p' kernel/reboot.c
+
+          echo "=== SELinux bounded transition ==="
+          grep -n -B8 -A35 'security_bounded_transition' \
+            security/selinux/hooks.c || true
