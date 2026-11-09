@@ -120,51 +120,210 @@ jobs:
           echo "ARM32 GCC:"
           arm-linux-androideabi-gcc --version
 
-      - name: Apply copy_to_iter compatibility fix
+      - name: Apply KernelSU Next Linux 4.4 build fixes
         shell: bash
         run: |
           set -euo pipefail
 
-          FILE="drivers/kernelsu/runtime/ksud_integration.c"
-
-          if [ ! -f "${FILE}" ]; then
-            echo "ERROR: ${FILE} was not found."
-            exit 1
-          fi
-
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("drivers/kernelsu/runtime/ksud_integration.c")
-          source = path.read_text()
+          # --------------------------------------------------
+          # Fix 1: copy_to_iter const compatibility
+          # --------------------------------------------------
+
+          integration = Path(
+              "drivers/kernelsu/runtime/ksud_integration.c"
+          )
+
+          if not integration.is_file():
+              raise SystemExit(
+                  f"ERROR: {integration} was not found."
+              )
+
+          source = integration.read_text()
 
           original = "copy_to_iter(KERNEL_SU_RC + ksu_rc_pos,"
           fixed = "copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),"
 
           if fixed in source:
-              print("Compatibility fix is already present.")
+              print("copy_to_iter compatibility fix already present.")
           elif original in source:
-              count = source.count(original)
-
-              if count != 1:
+              if source.count(original) != 1:
                   raise SystemExit(
-                      f"ERROR: Expected exactly one occurrence, found {count}."
+                      "ERROR: Unexpected number of copy_to_iter calls."
                   )
 
               source = source.replace(original, fixed, 1)
-              path.write_text(source)
+              integration.write_text(source)
 
               print("Applied copy_to_iter compatibility fix.")
           else:
               raise SystemExit(
-                  "ERROR: Could not find the expected copy_to_iter call. "
-                  "No source changes were made."
+                  "ERROR: Expected copy_to_iter call was not found."
               )
+
+          # --------------------------------------------------
+          # Fix 2: backport path_umount into fs/namespace.c
+          # --------------------------------------------------
+
+          namespace = Path("fs/namespace.c")
+
+          if not namespace.is_file():
+              raise SystemExit("ERROR: fs/namespace.c was not found.")
+
+          source = namespace.read_text()
+
+          can_signature = (
+              "static int can_umount(const struct path *path, int flags)"
+          )
+
+          umount_signature = (
+              "int path_umount(struct path *path, int flags)"
+          )
+
+          has_can = can_signature in source
+          has_umount = umount_signature in source
+
+          if has_can != has_umount:
+              raise SystemExit(
+                  "ERROR: Only part of the path_umount backport "
+                  "already exists. Stopping to avoid duplicate or "
+                  "incomplete kernel functions."
+              )
+
+          if not has_can:
+              anchor = (
+                  "static bool is_mnt_ns_file(struct dentry *dentry)"
+              )
+
+              if source.count(anchor) != 1:
+                  raise SystemExit(
+                      "ERROR: Could not uniquely locate the "
+                      "is_mnt_ns_file insertion point in fs/namespace.c."
+                  )
+
+              backport = r'''
+          static int can_umount(const struct path *path, int flags)
+          {
+              struct mount *mnt = real_mount(path->mnt);
+
+              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+                  return -EINVAL;
+              if (!may_mount())
+                  return -EPERM;
+              if (path->dentry != path->mnt->mnt_root)
+                  return -EINVAL;
+              if (!check_mnt(mnt))
+                  return -EINVAL;
+              if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                  return -EINVAL;
+              if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+                  return -EPERM;
+              return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+              struct mount *mnt = real_mount(path->mnt);
+              int ret;
+
+              ret = can_umount(path, flags);
+              if (!ret)
+                  ret = do_umount(mnt, flags);
+
+              /* Do not use path_put(), which clears mnt_expiry_mark. */
+              dput(path->dentry);
+              mntput_no_expire(mnt);
+              return ret;
+          }
+
+          '''
+
+              source = source.replace(
+                  anchor,
+                  backport + anchor,
+                  1
+              )
+
+              namespace.write_text(source)
+
+              print("Inserted path_umount backport into fs/namespace.c.")
+          else:
+              print("path_umount implementation already exists.")
+
+          # --------------------------------------------------
+          # Fix 3: add path_umount declaration to fs/internal.h
+          # --------------------------------------------------
+
+          internal = Path("fs/internal.h")
+
+          if not internal.is_file():
+              raise SystemExit("ERROR: fs/internal.h was not found.")
+
+          header = internal.read_text()
+
+          declaration = (
+              "int path_umount(struct path *path, int flags);"
+          )
+
+          if declaration not in header:
+              anchor = "extern void __init mnt_init(void);"
+
+              if header.count(anchor) != 1:
+                  raise SystemExit(
+                      "ERROR: Could not uniquely locate the "
+                      "mnt_init declaration in fs/internal.h."
+                  )
+
+              header = header.replace(
+                  anchor,
+                  anchor + "\n" + declaration,
+                  1
+              )
+
+              internal.write_text(header)
+
+              print("Added path_umount declaration to fs/internal.h.")
+          else:
+              print("path_umount declaration already exists.")
+
+          # --------------------------------------------------
+          # Verify all three fixes before compilation
+          # --------------------------------------------------
+
+          namespace_text = namespace.read_text()
+          header_text = internal.read_text()
+          integration_text = integration.read_text()
+
+          if namespace_text.count(can_signature) != 1:
+              raise SystemExit(
+                  "ERROR: can_umount implementation verification failed."
+              )
+
+          if namespace_text.count(umount_signature) != 1:
+              raise SystemExit(
+                  "ERROR: path_umount implementation verification failed."
+              )
+
+          if header_text.count(declaration) != 1:
+              raise SystemExit(
+                  "ERROR: path_umount declaration verification failed."
+              )
+
+          if fixed not in integration_text:
+              raise SystemExit(
+                  "ERROR: copy_to_iter compatibility verification failed."
+              )
+
+          print()
+          print("All KernelSU Next Linux 4.4 build fixes verified.")
           PY
 
           echo
-          echo "Updated source line:"
-          grep -n -F "copy_to_iter((void *)(KERNEL_SU_RC" "${FILE}"
+          echo "Checking path_umount insertion:"
+          grep -n -E 'can_umount|path_umount' fs/namespace.c
+          grep -n -F 'int path_umount' fs/internal.h
 
       - name: Generate OnePlus 5 kernel configuration
         shell: bash
@@ -273,30 +432,38 @@ jobs:
             echo "Build step outcome: ${BUILD_OUTCOME:-unknown}"
             echo
             echo "KernelSU configuration:"
+
             if [ -f out/.config ]; then
               grep -E '^CONFIG_KSU(=|_)' out/.config || true
             else
               echo "Configuration file not found."
             fi
+
             echo
             echo "Kernel image:"
+
             if [ -f out/arch/arm64/boot/Image.gz ]; then
               ls -lh out/arch/arm64/boot/Image.gz
             else
               echo "Image.gz was not generated."
             fi
+
             echo
             echo "Device tree blobs:"
+
             if [ -d out/arch/arm64/boot/dts ]; then
               find out/arch/arm64/boot/dts -type f -name '*.dtb' -print
             else
               echo "DTB directory not found."
             fi
+
             echo
             echo "Current source commit:"
             git rev-parse HEAD
+
             echo
             echo "Build log: kernel-build.log"
+
           } > "${REPORT}"
 
           cat "${REPORT}"
