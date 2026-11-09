@@ -1,25 +1,31 @@
 
-name: OnePlus 5 KernelSU Next Patch Validation
+name: OnePlus 5 KernelSU Next Source Audit
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  validate:
+  audit:
+    name: Inspect OnePlus 5 kernel integration points
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Check out kernel source
+      - name: Check out OnePlus 5 kernel source
         uses: actions/checkout@v5
         with:
           ref: lineage-22.2
           fetch-depth: 1
 
       - name: Add KernelSU Next legacy source
+        shell: bash
         run: |
+          set -e
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-      - name: Apply and validate OnePlus 5 integration patch
+      - name: Inspect kernel source and KernelSU interfaces
         shell: bash
         run: |
           python3 <<'PY'
@@ -27,227 +33,170 @@ jobs:
           import re
           import sys
 
-          def read(path):
-              p = Path(path)
-              if not p.exists():
-                  sys.exit(f"ERROR: Missing source file: {path}")
-              return p.read_text()
+          output = []
 
-          def write(path, content):
-              Path(path).write_text(content)
+          def report(title, content):
+              output.append("")
+              output.append("=" * 75)
+              output.append(title)
+              output.append("=" * 75)
+              output.append(content)
 
-          def once(text, old, new, description):
-              count = text.count(old)
-              if count != 1:
-                  sys.exit(
-                      f"STOP: Expected exactly one match for {description}, "
-                      f"found {count}. No safe automatic patch can be made."
-                  )
-              return text.replace(old, new, 1)
+          def inspect_file(filename, patterns, radius=18):
+              path = Path(filename)
+              if not path.exists():
+                  report(filename, "FILE NOT FOUND")
+                  return
 
-          # fs/exec.c
-          path = "fs/exec.c"
-          s = read(path)
+              lines = path.read_text(errors="replace").splitlines()
+              found = set()
+              sections = []
 
-          declaration = """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
-                          void *argv, void *envp, int *flags);
-          #endif
+              for number, line in enumerate(lines):
+                  for pattern in patterns:
+                      if re.search(pattern, line):
+                          start = max(0, number - radius)
+                          end = min(len(lines), number + radius + 1)
+                          key = (start, end)
+                          if key not in found:
+                              found.add(key)
+                              sections.append(
+                                  "\n--- Lines {} to {} ---\n{}".format(
+                                      start + 1,
+                                      end,
+                                      "\n".join(
+                                          f"{i + 1}: {lines[i]}"
+                                          for i in range(start, end)
+                                      )
+                                  )
+                              )
 
-          """
-
-          s = once(
-              s,
-              "int do_execve(struct filename *filename,",
-              declaration + "int do_execve(struct filename *filename,",
-              "execve handler declaration"
-          )
-
-          old_return = "return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"
-          new_return = """#ifdef CONFIG_KSU
-              ksu_handle_execveat((int *)AT_FDCWD, &filename, &argv, &envp, 0);
-          #endif
-              return do_execveat_common(AT_FDCWD, filename, argv, envp, 0);"""
-
-          count = s.count(old_return)
-          if count != 2:
-              sys.exit(
-                  "STOP: Expected the do_execve and compat_do_execve return "
-                  f"locations in fs/exec.c, found {count}."
+              report(
+                  filename,
+                  "\n".join(sections) if sections else "No matching functions found."
               )
-          s = s.replace(old_return, new_return)
-          write(path, s)
 
-          # fs/open.c
-          path = "fs/open.c"
-          s = read(path)
-
-          declaration = """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
-                          int *mode, int *flags);
-          #endif
-
-          """
-          s = once(
-              s,
-              "SYSCALL_DEFINE3(faccessat,",
-              declaration + "SYSCALL_DEFINE3(faccessat,",
-              "faccessat handler declaration"
-          )
-          s = once(
-              s,
-              "\tunsigned int lookup_flags = LOOKUP_FOLLOW;",
-              """\tunsigned int lookup_flags = LOOKUP_FOLLOW;
-
-          #ifdef CONFIG_KSU
-              ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif""",
-              "faccessat handler call"
-          )
-          write(path, s)
-
-
-# fs/read_write.c
-path = "fs/read_write.c"
-s = read(path)
-
-declaration = """#ifdef CONFIG_KSU
-extern bool ksu_vfs_read_hook __read_mostly;
-extern __attribute__((cold)) int ksu_handle_sys_read(unsigned int fd,
-                char __user **buf_ptr, size_t *count_ptr);
-#endif
-
-"""
-s = once(
-    s,
-    "SYSCALL_DEFINE3(read,",
-    declaration + "SYSCALL_DEFINE3(read,",
-    "read handler declaration"
-)
-
-marker = "SYSCALL_DEFINE3(read,"
-start = s.index(marker)
-end = s.find("\n}", start)
-if end < 0:
-    sys.exit("STOP: Could not identify the end of the read syscall.")
-
-section = s[start:end]
-section = once(
-    section,
-    "\tssize_t ret = -EBADF;",
-    """\tssize_t ret = -EBADF;
-
-#ifdef CONFIG_KSU
-    if (unlikely(ksu_vfs_read_hook))
-        ksu_handle_sys_read(fd, &buf, &count);
-#endif""",
-    "read handler call"
-)
-s = s[:start] + section + s[end:]
-write(path, s)
-
-          # fs/stat.c
-          path = "fs/stat.c"
-          s = read(path)
-
-          declaration = """#ifdef CONFIG_KSU
-          __attribute__((hot))
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
-                          int *flags);
-          #endif
-
-          """
-          s = once(
-              s,
-              "SYSCALL_DEFINE4(newfstatat,",
-              declaration + "SYSCALL_DEFINE4(newfstatat,",
-              "newfstatat handler declaration"
+          report(
+              "DEVICE AND BRANCH",
+              "Repository: halmo-tech/android_kernel_oneplus_msm8998\n"
+              "Branch: lineage-22.2\n"
+              "Target: OnePlus 5 (cheeseburger)\n"
+              "Kernel family: Linux 4.4"
           )
 
-          marker = "SYSCALL_DEFINE4(newfstatat,"
-          start = s.index(marker)
-          end = s.find("\n}", start)
-          if end < 0:
-              sys.exit("STOP: Could not identify the end of newfstatat.")
-          section = s[start:end]
-          section = once(
-              section,
-              "\tint error;",
-              """\tint error;
-
-          #ifdef CONFIG_KSU
-              ksu_handle_stat(&dfd, &filename, &flag);
-          #endif""",
-              "newfstatat handler call"
-          )
-          s = s[:start] + section + s[end:]
-          write(path, s)
-
-          # kernel/reboot.c
-          path = "kernel/reboot.c"
-          s = read(path)
-
-          declaration = """#ifdef CONFIG_KSU
-          extern int ksu_handle_sys_reboot(int magic1, int magic2,
-                          unsigned int cmd, void __user **arg);
-          #endif
-
-          """
-          s = once(
-              s,
-              "SYSCALL_DEFINE4(reboot,",
-              declaration + "SYSCALL_DEFINE4(reboot,",
-              "reboot handler declaration"
+          inspect_file(
+              "fs/exec.c",
+              [
+                  r"do_execve\s*\(",
+                  r"compat_do_execve\s*\(",
+                  r"do_execveat_common\s*\("
+              ],
+              24
           )
 
-          marker = "SYSCALL_DEFINE4(reboot,"
-          start = s.index(marker)
-          end = s.find("\n}", start)
-          if end < 0:
-              sys.exit("STOP: Could not identify the end of reboot syscall.")
-          section = s[start:end]
-          section = once(
-              section,
-              "\tint ret = 0;",
-              """\tint ret = 0;
-
-          #ifdef CONFIG_KSU
-              ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
-          #endif""",
-              "reboot handler call"
+          inspect_file(
+              "fs/open.c",
+              [
+                  r"SYSCALL_DEFINE3\s*\(\s*faccessat"
+              ],
+              28
           )
-          s = s[:start] + section + s[end:]
-          write(path, s)
 
-          # OnePlus 5 defconfig
-          path = "arch/arm64/configs/lineage_oneplus5_defconfig"
-          s = read(path)
+          inspect_file(
+              "fs/read_write.c",
+              [
+                  r"vfs_read\s*\(",
+                  r"SYSCALL_DEFINE3\s*\(\s*read"
+              ],
+              28
+          )
 
-          if "CONFIG_KSU=" in s:
-              sys.exit("STOP: CONFIG_KSU is already present. Review the existing setting.")
-          s = s.rstrip() + """
+          inspect_file(
+              "fs/stat.c",
+              [
+                  r"SYSCALL_DEFINE4\s*\(\s*newfstatat"
+              ],
+              28
+          )
 
-          # KernelSU Next
-          CONFIG_KSU=y
-          CONFIG_KSU_MANUAL_HOOK=y
-          """
-          write(path, s)
+          inspect_file(
+              "kernel/reboot.c",
+              [
+                  r"SYSCALL_DEFINE4\s*\(\s*reboot"
+              ],
+              28
+          )
 
-          print("All five KernelSU Next hook locations matched and were patched.")
-          print("OnePlus 5 defconfig updated for KernelSU manual hook mode.")
+          inspect_file(
+              "arch/arm64/configs/lineage_oneplus5_defconfig",
+              [
+                  r"CONFIG_KSU",
+                  r"CONFIG_KPROBES",
+                  r"CONFIG_MODULES"
+              ],
+              5
+          )
+
+          ksu_paths = [
+              "KernelSU",
+              "drivers/kernelsu",
+              "KernelSU/kernel",
+              "drivers/kernelsu/kernel"
+          ]
+
+          for name in ksu_paths:
+              path = Path(name)
+              if path.exists():
+                  report(
+                      "KernelSU source location",
+                      f"Found: {name}\n"
+                      + "\n".join(str(p) for p in path.rglob("Kconfig")[:10])
+                  )
+
+          for path in Path(".").rglob("Kconfig"):
+              if "KernelSU" in str(path) or "kernelsu" in str(path).lower():
+                  text = path.read_text(errors="replace")
+                  if "config KSU" in text:
+                      report(
+                          f"KernelSU Kconfig: {path}",
+                          text[:16000]
+                      )
+
+          for path in Path(".").rglob("*.h"):
+              if "KernelSU" in str(path) or "kernelsu" in str(path).lower():
+                  text = path.read_text(errors="replace")
+                  if any(
+                      name in text
+                      for name in [
+                          "ksu_handle_execveat",
+                          "ksu_handle_faccessat",
+                          "ksu_handle_sys_read",
+                          "ksu_handle_stat",
+                          "ksu_handle_sys_reboot"
+                      ]
+                  ):
+                      report(
+                          f"KernelSU hook declarations: {path}",
+                          text[:12000]
+                      )
+
+          report(
+              "AUDIT RESULT",
+              "Source inspection completed. No kernel source files were patched "
+              "by this audit."
+          )
+
+          Path("kernelsu-source-audit.txt").write_text(
+              "\n".join(output) + "\n"
+          )
+
+          print("Source audit completed.")
+          print("Report saved as kernelsu-source-audit.txt")
           PY
 
-      - name: Check patch formatting
-        run: |
-          git diff --check
-          git diff > kernelsu-next-oneplus5.patch
-          test -s kernelsu-next-oneplus5.patch
-          echo "Patch generated successfully."
-
-      - name: Upload patch artifact
+      - name: Upload source audit report
         uses: actions/upload-artifact@v4
         with:
-          name: kernelsu-next-oneplus5-patch
-          path: kernelsu-next-oneplus5.patch
+          name: oneplus5-kernelsu-source-audit
+          path: kernelsu-source-audit.txt
+          if-no-files-found: error
