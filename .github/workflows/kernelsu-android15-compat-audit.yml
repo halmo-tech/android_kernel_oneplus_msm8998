@@ -1,0 +1,148 @@
+name: OnePlus 5 KernelSU Android 15 Compatibility Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          ref: lineage-22.2
+
+      - name: Add KernelSU Next for inspection
+        shell: bash
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+      - name: Inspect Android 15 compatibility hooks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          output = []
+
+          def inspect(path, terms, before=10, after=20):
+              p = Path(path)
+              output.append("\n" + "=" * 78)
+              output.append(str(path))
+              output.append("=" * 78)
+
+              if not p.exists():
+                  output.append("FILE NOT FOUND")
+                  return
+
+              lines = p.read_text(errors="replace").splitlines()
+              ranges = []
+
+              for i, line in enumerate(lines):
+                  if any(term in line for term in terms):
+                      start = max(0, i - before)
+                      end = min(len(lines), i + after + 1)
+                      ranges.append((start, end))
+
+              if not ranges:
+                  output.append("No matching lines found.")
+                  return
+
+              merged = []
+              for start, end in ranges:
+                  if merged and start <= merged[-1][1]:
+                      merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                  else:
+                      merged.append((start, end))
+
+              for start, end in merged:
+                  output.append(f"\n--- Lines {start + 1} to {end} ---")
+                  for n in range(start, end):
+                      output.append(f"{n + 1}: {lines[n]}")
+
+          output.append("OnePlus 5, cheeseburger")
+          output.append("Kernel: Linux 4.4.302")
+          output.append("Branch: lineage-22.2")
+
+          inspect(
+              "kernel/sys.c",
+              ["SYSCALL_DEFINE3(setresuid", "SYSCALL_DEFINE3(setuid"],
+              12, 28
+          )
+
+          inspect(
+              "fs/exec.c",
+              ["do_execveat_common(", "__do_execve_file("],
+              12, 28
+          )
+
+          inspect(
+              "fs/stat.c",
+              [
+                  "SYSCALL_DEFINE2(newfstat",
+                  "SYSCALL_DEFINE2(fstat64",
+                  "SYSCALL_DEFINE4(fstatat64",
+                  "ksu_handle_newfstat_ret",
+                  "ksu_handle_fstat64_ret"
+              ],
+              10, 28
+          )
+
+          inspect(
+              "security/selinux/hooks.c",
+              [
+                  "security_bounded_transition",
+                  "bounded_transition",
+                  "security_transition_sid"
+              ],
+              12, 24
+          )
+
+          inspect(
+              "KernelSU-Next/kernel/hook/setuid_hook.c",
+              ["ksu_handle_setresuid"],
+              10, 24
+          )
+
+          inspect(
+              "KernelSU-Next/kernel/hook/setuid_hook.h",
+              ["ksu_handle_setresuid"],
+              5, 12
+          )
+
+          inspect(
+              "KernelSU-Next/kernel/selinux/selinux.c",
+              [
+                  "security_bounded_transition",
+                  "ksu",
+                  "init"
+              ],
+              8, 18
+          )
+
+          inspect(
+              "KernelSU-Next/kernel/selinux/selinux.h",
+              ["bounded_transition", "ksu"],
+              5, 12
+          )
+
+          output.append("\n" + "=" * 78)
+          output.append("AUDIT COMPLETION")
+          output.append("Inspection only. No kernel source files were modified.")
+
+          report = "\n".join(output)
+          Path("kernelsu-android15-compat-audit.txt").write_text(report)
+          print(report)
+          PY
+
+      - name: Upload compatibility audit
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus5-kernelsu-android15-compat-audit
+          path: kernelsu-android15-compat-audit.txt
+          if-no-files-found: error
