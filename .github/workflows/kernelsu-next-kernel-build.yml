@@ -136,12 +136,15 @@ jobs:
             libelf-dev \
             libssl-dev \
             lz4 \
+            patch \
             python3 \
             rsync \
             tar \
             unzip \
             zip \
             zlib1g-dev
+
+          patch --version
 
       - name: Download Android NDK r25c
         shell: bash
@@ -267,11 +270,12 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          trap 'rc=$?; echo "::error::Command failed at line ${LINENO}: ${BASH_COMMAND} (exit code ${rc})"; exit "$rc"' ERR
-
           PATCH="${RUNNER_TEMP}/kernelsu-next-linux-4.4-compat.diff"
           KSU_DIR="KernelSU-Next"
           COMPAT_HEADER="${KSU_DIR}/kernel/compat/kernel_compat.h"
+
+          DRY_RUN_LOG="${RUNNER_TEMP}/ksu-compat-dry-run.log"
+          APPLY_LOG="${RUNNER_TEMP}/ksu-compat-apply.log"
 
           echo "===== STEP 1: Check KernelSU source directory ====="
 
@@ -321,45 +325,81 @@ jobs:
           echo
           echo "===== STEP 3: Inspect patch contents ====="
 
-          echo "Patch file headers:"
-          grep -nE '^(diff --git|--- |\+\+\+ )' "$PATCH" || {
-            echo "::error::No standard unified diff file headers found."
-            exit 1
-          }
+          grep -nE '^(diff --git|--- |\+\+\+ )' "$PATCH"
+
+          for required in \
+            'kernel/compat/kernel_compat.h' \
+            'kernel/feature/adb_root.c' \
+            'kernel/feature/selinux_hide.c' \
+            'ALIGN_DOWN' \
+            '__nocfi'
+          do
+            if grep -Fq -- "$required" "$PATCH"; then
+              echo "PASS: Found $required in patch."
+            else
+              echo "::error::Required patch content missing: $required"
+              exit 1
+            fi
+          done
 
           echo
-          echo "Checking ALIGN_DOWN..."
+          echo "===== STEP 4: Dry-run patch application ====="
 
-          if grep -Fn -- 'ALIGN_DOWN' "$PATCH"; then
-            echo "PASS: ALIGN_DOWN found in patch."
+          if patch \
+            --dry-run \
+            --batch \
+            --forward \
+            -p1 \
+            -d "$KSU_DIR" \
+            < "$PATCH" 2>&1 | tee "$DRY_RUN_LOG"
+          then
+            echo "PASS: GNU patch dry run completed."
           else
-            echo "::error::ALIGN_DOWN is missing from the downloaded patch."
+            echo "::error::GNU patch dry run failed."
             exit 1
           fi
 
-          echo
-          echo "Checking __nocfi..."
-
-          if grep -Fn -- '__nocfi' "$PATCH"; then
-            echo "PASS: __nocfi found in patch."
-          else
-            echo "::error::__nocfi is missing from the downloaded patch."
-            exit 1
-          fi
-
-          echo
-          echo "===== STEP 4: Check whether patch can be applied ====="
-
-          git -C "$KSU_DIR" apply --check --verbose "$PATCH"
-
-          echo "PASS: Git confirms that the patch can be applied."
+          for target in \
+            'kernel/compat/kernel_compat.h' \
+            'kernel/feature/adb_root.c' \
+            'kernel/feature/selinux_hide.c'
+          do
+            if grep -Fq "checking file $target" "$DRY_RUN_LOG"; then
+              echo "PASS: Dry run checked $target"
+            else
+              echo "::error::Dry run did not check $target"
+              exit 1
+            fi
+          done
 
           echo
           echo "===== STEP 5: Apply compatibility patch ====="
 
-          git -C "$KSU_DIR" apply "$PATCH"
+          if patch \
+            --batch \
+            --forward \
+            -p1 \
+            -d "$KSU_DIR" \
+            < "$PATCH" 2>&1 | tee "$APPLY_LOG"
+          then
+            echo "PASS: GNU patch application completed."
+          else
+            echo "::error::GNU patch application failed."
+            exit 1
+          fi
 
-          echo "PASS: Compatibility patch applied."
+          for target in \
+            'kernel/compat/kernel_compat.h' \
+            'kernel/feature/adb_root.c' \
+            'kernel/feature/selinux_hide.c'
+          do
+            if grep -Fq "patching file $target" "$APPLY_LOG"; then
+              echo "PASS: Applied changes to $target"
+            else
+              echo "::error::Patch did not report modifying $target"
+              exit 1
+            fi
+          done
 
           echo
           echo "===== STEP 6: Verify patched KernelSU files ====="
