@@ -1,572 +1,143 @@
-name: OnePlus 5 KernelSU Next Kernel Build
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build KernelSU Next for OnePlus 5
-    runs-on: ubuntu-22.04
-    timeout-minutes: 180
-
-    steps:
-      - name: Checkout kernel source
-        uses: actions/checkout@v5
-        with:
-          ref: lineage-22.2
-          fetch-depth: 0
-
-      - name: Verify kernel source and manual hooks
-        run: |
-          set -uo pipefail
-
-          FAILED=0
-
-          check_file() {
-            if [ -f "$1" ]; then
-              echo "PASS: File exists: $1"
-            else
-              echo "FAIL: Missing file: $1"
-              FAILED=1
-            fi
-          }
-
-          check_text() {
-            if grep -Fq "$1" "$2" 2>/dev/null; then
-              echo "PASS: Found expected text in $2"
-            else
-              echo "FAIL: Expected text not found in $2"
-              echo "      Expected: $1"
-              FAILED=1
-            fi
-          }
-
-          echo "===== Kernel source diagnostic ====="
-          echo "Branch: $(git branch --show-current)"
-          echo "Current commit: $(git rev-parse HEAD)"
-          echo
-
-          check_file Makefile
-          check_file arch/arm64/configs/lineage_oneplus5_defconfig
-          check_file fs/exec.c
-          check_file fs/open.c
-          check_file fs/read_write.c
-          check_file fs/stat.c
-          check_file fs/internal.h
-          check_file fs/namespace.c
-          check_file kernel/reboot.c
-          check_file kernel/sys.c
-          check_file security/selinux/hooks.c
-          check_file security/selinux/include/objsec.h
-          check_file include/linux/kernelsu.h
-
-          echo
-          echo "Checking integration commit..."
-
-          if git cat-file -e '8e7088d77725^{commit}' 2>/dev/null; then
-            echo "PASS: Integration commit exists"
-
-            if git merge-base --is-ancestor 8e7088d77725 HEAD; then
-              echo "PASS: Integration commit is an ancestor of HEAD"
-            else
-              echo "FAIL: Integration commit is not an ancestor of HEAD"
-              FAILED=1
-            fi
-          else
-            echo "FAIL: Integration commit 8e7088d77725 is missing"
-            FAILED=1
-          fi
-
-          echo
-          echo "Checking manual hook includes..."
-
-          check_text '#include <linux/kernelsu.h>' fs/exec.c
-          check_text '#include <linux/kernelsu.h>' fs/open.c
-          check_text '#include <linux/kernelsu.h>' fs/read_write.c
-          check_text '#include <linux/kernelsu.h>' fs/stat.c
-          check_text '#include <linux/kernelsu.h>' kernel/reboot.c
-          check_text '#include <linux/kernelsu.h>' kernel/sys.c
-
-          echo
-          echo "Checking manual hook calls..."
-
-          check_text 'ksu_handle_execveat' fs/exec.c
-          check_text 'ksu_handle_faccessat' fs/open.c
-          check_text 'ksu_handle_vfs_read' fs/read_write.c
-          check_text 'ksu_handle_stat' fs/stat.c
-          check_text 'ksu_handle_newfstat_ret' fs/stat.c
-          check_text 'ksu_handle_fstat64_ret' fs/stat.c
-          check_text 'ksu_handle_sys_reboot' kernel/reboot.c
-          check_text 'ksu_handle_setresuid' kernel/sys.c
-
-          echo
-          echo "Checking SELinux integration..."
-
-          check_text 'is_ksu_transition' security/selinux/hooks.c
-          check_text 'selinux_inode(const struct inode *inode)' security/selinux/include/objsec.h
-
-          echo
-          echo "===== Diagnostic result ====="
-
-          if [ "$FAILED" -ne 0 ]; then
-            echo "RESULT: Source verification failed. See FAIL lines above."
-            exit 1
-          fi
-
-          echo "RESULT: All kernel source and manual hook checks passed."
-
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y \
-            bc \
-            bison \
-            build-essential \
-            curl \
-            flex \
-            git \
-            libelf-dev \
-            libssl-dev \
-            lz4 \
-            python3 \
-            rsync \
-            tar \
-            unzip \
-            zip \
-            zlib1g-dev
-
-      - name: Download Android NDK r25c
-        run: |
-          set -euo pipefail
-
-          NDK_ARCHIVE="${RUNNER_TEMP}/android-ndk-r25c-linux.zip"
-          NDK_DIR="${RUNNER_TEMP}/android-ndk-r25c"
-          NDK_BIN="${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
-          curl -fL --retry 3 \
-            https://dl.google.com/android/repository/android-ndk-r25c-linux.zip \
-            -o "$NDK_ARCHIVE"
-
-          unzip -q "$NDK_ARCHIVE" -d "${RUNNER_TEMP}"
-
-          test -x "${NDK_BIN}/clang"
-
-          echo "${NDK_BIN}" >> "$GITHUB_PATH"
-
-          echo "NDK clang version:"
-          "${NDK_BIN}/clang" --version
-
-      - name: Download Android GCC 4.9 cross compilers
-        run: |
-          set -euo pipefail
-
-          git clone --depth=1 --branch lineage-19.1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            "${RUNNER_TEMP}/gcc64"
-
-          git clone --depth=1 --branch lineage-19.1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
-            "${RUNNER_TEMP}/gcc32"
-
-          test -x "${RUNNER_TEMP}/gcc64/bin/aarch64-linux-android-gcc"
-          test -x "${RUNNER_TEMP}/gcc32/bin/arm-linux-androideabi-gcc"
-
-          echo "AArch64 GCC:"
-          "${RUNNER_TEMP}/gcc64/bin/aarch64-linux-android-gcc" --version
-
-          echo "ARM32 GCC:"
-          "${RUNNER_TEMP}/gcc32/bin/arm-linux-androideabi-gcc" --version
-
-          echo "${RUNNER_TEMP}/gcc64/bin" >> "$GITHUB_PATH"
-          echo "${RUNNER_TEMP}/gcc32/bin" >> "$GITHUB_PATH"
-
-      - name: Verify compiler PATH
-        run: |
-          set -euo pipefail
-
-          command -v clang
-          command -v aarch64-linux-android-gcc
-          command -v arm-linux-androideabi-gcc
-
-          clang --version
-          aarch64-linux-android-gcc --version
-          arm-linux-androideabi-gcc --version
-
-      - name: Download and pin KernelSU Next source
-        run: |
-          set -euo pipefail
-
-          KSU_COMMIT="a54e4fa46c6cc25bcaa055cf14d790194beffed8"
-          KSU_ARCHIVE="${RUNNER_TEMP}/kernelsu-next-${KSU_COMMIT}.tar.gz"
-
-          echo "Downloading exact KernelSU Next commit:"
-          echo "$KSU_COMMIT"
-
-          rm -rf KernelSU-Next
-          mkdir -p KernelSU-Next
-
-          curl -fL --retry 3 \
-            "https://github.com/KernelSU-Next/KernelSU-Next/archive/${KSU_COMMIT}.tar.gz" \
-            -o "$KSU_ARCHIVE"
-
-          tar -tzf "$KSU_ARCHIVE" > "${RUNNER_TEMP}/ksu-archive-list.txt"
-          test -s "${RUNNER_TEMP}/ksu-archive-list.txt"
-
-          tar -xzf "$KSU_ARCHIVE" \
-            --strip-components=1 \
-            -C KernelSU-Next
-
-          test -s KernelSU-Next/kernel/Kbuild
-          test -s KernelSU-Next/kernel/Kconfig
-
-          printf '%s\n' "$KSU_COMMIT" > KernelSU-Next/.source-commit
-
-          if [ -e drivers/kernelsu ] && [ ! -L drivers/kernelsu ]; then
-            echo "ERROR: drivers/kernelsu exists and is not a symlink."
-            exit 1
-          fi
-
-          rm -f drivers/kernelsu
-          ln -s ../KernelSU-Next/kernel drivers/kernelsu
-
-          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
-            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
-
-          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
-            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-          test -L drivers/kernelsu
-          test -s drivers/kernelsu/Kbuild
-          test -s drivers/kernelsu/Kconfig
-
-          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
-          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
-          echo "KernelSU Next source downloaded and linked."
-          echo "Pinned commit: $(cat KernelSU-Next/.source-commit)"
-
       - name: Download and apply Linux 4.4 KernelSU compatibility patch
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          trap 'rc=$?; echo "::error::Command failed at line ${LINENO}: ${BASH_COMMAND} (exit code ${rc})"; exit "$rc"' ERR
 
           PATCH="${RUNNER_TEMP}/kernelsu-next-linux-4.4-compat.diff"
+          KSU_DIR="KernelSU-Next"
+          COMPAT_HEADER="${KSU_DIR}/kernel/compat/kernel_compat.h"
 
-          curl -fL --retry 3 \
-            https://raw.githubusercontent.com/TosteRino/joan-kernelsu/main/patches/kernelsu-next-linux-4.4-compat.diff \
-            -o "$PATCH"
+          echo "===== STEP 1: Check KernelSU source directory ====="
 
-          test -s "$PATCH"
-          grep -Fq 'ALIGN_DOWN' "$PATCH"
-          grep -Fq '__nocfi' "$PATCH"
-
-          git -C KernelSU-Next apply --check "$PATCH"
-          git -C KernelSU-Next apply "$PATCH"
-
-          grep -Fq 'ALIGN_DOWN' KernelSU-Next/kernel/compat/kernel_compat.h
-          grep -Fq '__nocfi' KernelSU-Next/kernel/compat/kernel_compat.h
-
-          echo "Linux 4.4 KernelSU compatibility patch applied and verified."
-
-      - name: Set KernelSU Next version metadata
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path("drivers/kernelsu/Kbuild")
-          content = path.read_text()
-
-          replacements = (
-              (
-                  "KSU_VERSION_FALLBACK := 1",
-                  "KSU_VERSION_FALLBACK := 33193",
-              ),
-              (
-                  "KSU_VERSION_TAG_FALLBACK := v0.0.1",
-                  "KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14",
-              ),
-          )
-
-          for old, new in replacements:
-              if new in content:
-                  continue
-
-              if old not in content:
-                  raise SystemExit(
-                      f"Expected Kbuild line not found: {old}"
-                  )
-
-              content = content.replace(old, new, 1)
-
-          path.write_text(content)
-
-          updated = path.read_text()
-
-          if "KSU_VERSION_FALLBACK := 33193" not in updated:
-              raise SystemExit("KernelSU version fallback was not updated.")
-
-          if "KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14" not in updated:
-              raise SystemExit("KernelSU version tag fallback was not updated.")
-
-          print("KernelSU version fallback: 33193")
-          print("KernelSU version tag fallback: v3.2.0-legacy-14")
-          PY
-
-      - name: Apply Linux 4.4 source compatibility fixes
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          # Fix the const pointer mismatch in the Linux 4.4 copy_to_iter API.
-          ksud = Path("drivers/kernelsu/runtime/ksud_integration.c")
-          source = ksud.read_text()
-
-          old_call = "copy_to_iter(KERNEL_SU_RC + ksu_rc_pos,"
-          new_call = "copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),"
-
-          if old_call in source:
-              source = source.replace(old_call, new_call, 1)
-              ksud.write_text(source)
-          elif new_call not in source:
-              raise SystemExit("Expected copy_to_iter() call was not found.")
-
-          # Backport path_umount() support before kernel compilation.
-          namespace = Path("fs/namespace.c")
-          source = namespace.read_text()
-
-          marker = "static bool is_mnt_ns_file(struct dentry *dentry)"
-
-          if marker not in source:
-              raise SystemExit(
-                  "Could not find insertion point in fs/namespace.c."
-              )
-
-          can_umount = r'''
-          static int can_umount(const struct path *path, int flags)
-          {
-              struct mount *mnt = real_mount(path->mnt);
-
-              if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
-                  return -EINVAL;
-              if (!may_mount())
-                  return -EPERM;
-              if (path->dentry != path->mnt->mnt_root)
-                  return -EINVAL;
-              if (!check_mnt(mnt))
-                  return -EINVAL;
-              if (mnt->mnt.mnt_flags & MNT_LOCKED)
-                  return -EINVAL;
-              if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
-                  return -EPERM;
-              return 0;
-          }
-          '''
-
-          path_umount = r'''
-          int path_umount(struct path *path, int flags)
-          {
-              struct mount *mnt = real_mount(path->mnt);
-              int ret;
-
-              ret = can_umount(path, flags);
-              if (!ret)
-                  ret = do_umount(mnt, flags);
-
-              /* Do not use path_put(), which clears mnt_expiry_mark. */
-              dput(path->dentry);
-              mntput_no_expire(mnt);
-              return ret;
-          }
-          '''
-
-          has_can_umount = "static int can_umount(" in source
-          has_path_umount = (
-              "int path_umount(struct path *path, int flags)" in source
-          )
-
-          if has_can_umount != has_path_umount:
-              raise SystemExit(
-                  "fs/namespace.c contains only part of the path_umount backport."
-              )
-
-          if not has_can_umount:
-              source = source.replace(
-                  marker,
-                  can_umount + "\n" + path_umount + "\n" + marker,
-                  1,
-              )
-
-          namespace.write_text(source)
-
-          # Add the path_umount() declaration to fs/internal.h.
-          internal = Path("fs/internal.h")
-          source = internal.read_text()
-
-          declaration = "int path_umount(struct path *path, int flags);"
-          prototype_marker = "extern void __init mnt_init(void);"
-
-          if declaration not in source:
-              if prototype_marker not in source:
-                  raise SystemExit(
-                      "Could not find insertion point in fs/internal.h."
-                  )
-
-              source = source.replace(
-                  prototype_marker,
-                  prototype_marker + "\n" + declaration,
-                  1,
-              )
-
-              internal.write_text(source)
-
-          # Verify all compatibility changes.
-          if new_call not in ksud.read_text():
-              raise SystemExit("copy_to_iter() compatibility fix is missing.")
-
-          if "static int can_umount(" not in namespace.read_text():
-              raise SystemExit("can_umount() backport is missing.")
-
-          if "int path_umount(struct path *path, int flags)" not in namespace.read_text():
-              raise SystemExit("path_umount() backport is missing.")
-
-          if declaration not in internal.read_text():
-              raise SystemExit("path_umount() declaration is missing.")
-
-          print("Linux 4.4 source compatibility fixes applied and verified.")
-          PY
-
-      - name: Verify KernelSU source and configuration
-        run: |
-          set -euo pipefail
-
-          test "$(cat KernelSU-Next/.source-commit)" = \
-            "a54e4fa46c6cc25bcaa055cf14d790194beffed8"
-
-          test -L drivers/kernelsu
-          test -s drivers/kernelsu/Kbuild
-          test -s drivers/kernelsu/Kconfig
-
-          grep -Fq 'KSU_VERSION_FALLBACK := 33193' drivers/kernelsu/Kbuild
-          grep -Fq 'KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14' drivers/kernelsu/Kbuild
-
-          grep -Fq 'ALIGN_DOWN' drivers/kernelsu/compat/kernel_compat.h
-          grep -Fq '__nocfi' drivers/kernelsu/compat/kernel_compat.h
-
-          grep -Fq 'selinux_inode(const struct inode *inode)' security/selinux/include/objsec.h
-          grep -Fq 'is_ksu_transition' security/selinux/hooks.c
-
-          grep -Fq 'ksu_handle_sys_reboot' kernel/reboot.c
-          grep -Fq 'ksu_handle_execveat' fs/exec.c
-          grep -Fq 'ksu_handle_faccessat' fs/open.c
-          grep -Fq 'ksu_handle_vfs_read' fs/read_write.c
-          grep -Fq 'ksu_handle_stat' fs/stat.c
-          grep -Fq 'ksu_handle_newfstat_ret' fs/stat.c
-          grep -Fq 'ksu_handle_fstat64_ret' fs/stat.c
-          grep -Fq 'ksu_handle_setresuid' kernel/sys.c
-
-          grep -Fq 'static int can_umount(' fs/namespace.c
-          grep -Fq 'int path_umount(struct path *path, int flags)' fs/namespace.c
-          grep -Fq 'int path_umount(struct path *path, int flags);' fs/internal.h
-
-          echo "KernelSU source, hooks, and compatibility checks passed."
-
-      - name: Configure OnePlus 5 kernel
-        run: |
-          set -euo pipefail
-
-          make -j2 O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 \
-            lineage_oneplus5_defconfig
-
-          grep -Fxq 'CONFIG_KSU=y' out/.config
-          grep -Fxq 'CONFIG_KSU_MANUAL_HOOK=y' out/.config
-
-          if grep -Fxq 'CONFIG_KSU_KPROBES_HOOK=y' out/.config; then
-            echo "ERROR: Kprobes hook is enabled. Manual hooks are required."
+          if [[ ! -d "$KSU_DIR" ]]; then
+            echo "::error::KernelSU-Next directory does not exist."
             exit 1
           fi
 
-          echo "KernelSU configuration verified."
+          for file in \
+            "$COMPAT_HEADER" \
+            "${KSU_DIR}/kernel/feature/adb_root.c" \
+            "${KSU_DIR}/kernel/feature/selinux_hide.c"
+          do
+            if [[ -f "$file" ]]; then
+              echo "PASS: Found $file"
+            else
+              echo "::error::Required KernelSU source file is missing: $file"
+              exit 1
+            fi
+          done
 
-      - name: Build KernelSU Next kernel
-        run: |
-          set -euo pipefail
+          echo
+          echo "===== STEP 2: Download compatibility patch ====="
 
-          JOBS="$(nproc)"
+          curl \
+            --fail \
+            --location \
+            --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 120 \
+            "https://raw.githubusercontent.com/TosteRino/joan-kernelsu/main/patches/kernelsu-next-linux-4.4-compat.diff" \
+            --output "$PATCH"
 
-          make -j"${JOBS}" O=out ARCH=arm64 SUBARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-android- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
-            CLANG_TRIPLE=aarch64-linux-gnu- LLVM=1 \
-            Image.gz dtbs 2>&1 | tee kernel-build.log
+          if [[ ! -s "$PATCH" ]]; then
+            echo "::error::Downloaded patch is empty or missing."
+            exit 1
+          fi
 
-          test -s out/arch/arm64/boot/Image.gz
-          test -d out/arch/arm64/boot/dts/qcom
+          echo "PASS: Patch downloaded."
+          echo "Patch size:"
+          wc -c "$PATCH"
+          echo "Patch line count:"
+          wc -l "$PATCH"
 
-          compgen -G 'out/arch/arm64/boot/dts/qcom/*.dtb' > /dev/null
+          echo
+          echo "===== STEP 3: Inspect patch contents ====="
 
-          grep -Fq -- '-- KernelSU-Next version fallback: 33193' kernel-build.log
-          grep -Fq -- '-- KernelSU-Next tag fallback: v3.2.0-legacy-14' kernel-build.log
+          echo "Patch file headers:"
+          grep -nE '^(diff --git|--- |\+\+\+ )' "$PATCH" || {
+            echo "::error::No standard unified diff file headers found."
+            exit 1
+          }
 
-          echo "Kernel image and device trees built successfully."
+          echo
+          echo "Checking ALIGN_DOWN..."
 
-          ls -lh out/arch/arm64/boot/Image.gz
-          ls -lh out/arch/arm64/boot/dts/qcom/*.dtb
+          if grep -Fn -- 'ALIGN_DOWN' "$PATCH"; then
+            echo "PASS: ALIGN_DOWN found in patch."
+          else
+            echo "::error::ALIGN_DOWN is missing from the downloaded patch."
+            exit 1
+          fi
 
-      - name: Generate build report
-        if: always()
-        run: |
-          {
-            echo "OnePlus 5 KernelSU Next Kernel Build Report"
-            echo "Device: OnePlus 5 (cheeseburger)"
-            echo "Architecture: ARM64"
-            echo "Kernel version: 4.4.302"
-            echo "Branch: lineage-22.2"
-            echo "Integration commit: 8e7088d77725"
-            echo "KernelSU Next revision: a54e4fa46c6cc25bcaa055cf14d790194beffed8"
-            echo "KernelSU Next version: v3.2.0-legacy-14"
-            echo "KernelSU Next version code: 33193"
-            echo "Defconfig: lineage_oneplus5_defconfig"
-            echo "Compiler: Android NDK r25c Clang"
-            echo "Build job status: ${{ job.status }}"
-            echo
-            echo "KernelSU configuration:"
-            grep -E '^CONFIG_KSU(=|_)' out/.config 2>/dev/null || true
-            echo
-            echo "Kernel image:"
-            ls -lh out/arch/arm64/boot/Image.gz 2>/dev/null || true
-            echo
-            echo "Device tree blobs:"
-            find out/arch/arm64/boot/dts/qcom \
-              -maxdepth 1 -name '*.dtb' -type f -print 2>/dev/null | sort || true
-            echo
-            echo "Current source commit:"
-            git rev-parse HEAD 2>/dev/null || true
-            echo
-            echo "Build log: kernel-build.log"
-          } > kernel-build-report.txt
+          echo
+          echo "Checking __nocfi..."
 
-          cat kernel-build-report.txt
+          if grep -Fn -- '__nocfi' "$PATCH"; then
+            echo "PASS: __nocfi found in patch."
+          else
+            echo "::error::__nocfi is missing from the downloaded patch."
+            exit 1
+          fi
 
-      - name: Upload kernel build artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: oneplus5-kernelsu-next-kernel-build
-          if-no-files-found: warn
-          retention-days: 7
-          path: |
-            kernel-build-report.txt
-            kernel-build.log
-            out/.config
-            out/System.map
-            out/vmlinux
-            out/arch/arm64/boot/Image.gz
-            out/arch/arm64/boot/dts/qcom/*.dtb
+          echo
+          echo "===== STEP 4: Check whether patch can be applied ====="
+
+          if git -C "$KSU_DIR" apply --check --verbose "$PATCH"; then
+            echo "PASS: Git confirms that the patch can be applied."
+          else
+            rc=$?
+            echo "::error::Patch applicability check failed with exit code ${rc}."
+            echo "Git patch diagnostic:"
+            git -C "$KSU_DIR" apply --check --verbose "$PATCH" || true
+            exit "$rc"
+          fi
+
+          echo
+          echo "===== STEP 5: Apply compatibility patch ====="
+
+          if git -C "$KSU_DIR" apply "$PATCH"; then
+            echo "PASS: Compatibility patch applied."
+          else
+            rc=$?
+            echo "::error::Applying the compatibility patch failed with exit code ${rc}."
+            exit "$rc"
+          fi
+
+          echo
+          echo "===== STEP 6: Verify patched KernelSU files ====="
+
+          if grep -Fn -- 'ALIGN_DOWN' "$COMPAT_HEADER"; then
+            echo "PASS: ALIGN_DOWN found in kernel_compat.h."
+          else
+            echo "::error::ALIGN_DOWN was not found in the patched header."
+            exit 1
+          fi
+
+          if grep -Fn -- '__nocfi' "$COMPAT_HEADER"; then
+            echo "PASS: __nocfi found in kernel_compat.h."
+          else
+            echo "::error::__nocfi was not found in the patched header."
+            exit 1
+          fi
+
+          if grep -Fq -- 'kernel_compat.h' "${KSU_DIR}/kernel/feature/adb_root.c"; then
+            echo "PASS: adb_root.c includes the compatibility header."
+          else
+            echo "::error::adb_root.c does not include kernel_compat.h."
+            exit 1
+          fi
+
+          if grep -Fq -- 'kernel_compat.h' "${KSU_DIR}/kernel/feature/selinux_hide.c"; then
+            echo "PASS: selinux_hide.c includes the compatibility header."
+          else
+            echo "::error::selinux_hide.c does not include kernel_compat.h."
+            exit 1
+          fi
+
+          echo
+          echo "===== RESULT ====="
+          echo "SUCCESS: Linux 4.4 compatibility patch applied and verified."
