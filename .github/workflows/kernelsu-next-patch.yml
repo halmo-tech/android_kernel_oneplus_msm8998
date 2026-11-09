@@ -1,0 +1,284 @@
+name: KernelSU Next OnePlus 5 Patch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kernelsu-next-oneplus5-patch
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    name: Integrate and validate KernelSU Next
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout OnePlus 5 kernel
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-22.2
+          fetch-depth: 0
+
+      - name: Checkout Linux 4.4 reference patches
+        uses: actions/checkout@v4
+        with:
+          repository: TosteRino/joan-kernelsu
+          ref: main
+          path: reference
+
+      - name: Check target kernel and reference patches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking OnePlus 5 kernel..."
+
+          test -f Makefile
+          test -f arch/arm64/configs/lineage_oneplus5_defconfig
+          test -f fs/exec.c
+          test -f fs/open.c
+          test -f fs/read_write.c
+          test -f fs/stat.c
+          test -f kernel/sys.c
+          test -f kernel/reboot.c
+          test -f security/selinux/hooks.c
+
+          grep -q 'VERSION = 4' Makefile
+          grep -q 'PATCHLEVEL = 4' Makefile
+          grep -q 'SUBLEVEL = 302' Makefile
+
+          for patch in \
+            reference/patches/kernelsu-next-linux-4.4-compat.diff \
+            reference/patches/manual-hooks-linux-4.4.diff \
+            reference/patches/post-kernelsu.diff
+          do
+            test -s "$patch"
+            echo "Found: $patch"
+            sha256sum "$patch"
+          done
+
+          echo "Reference repository revision:"
+          git -C reference rev-parse HEAD
+
+      - name: Integrate KernelSU Next legacy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fLSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            | bash -s legacy
+
+          test -d KernelSU-Next
+          test -f KernelSU-Next/kernel/Kconfig
+
+          echo "Pinning KernelSU Next to the revision used by the reference patches..."
+
+          git -C KernelSU-Next fetch --depth=1 origin a54e4fa4
+          git -C KernelSU-Next checkout --detach FETCH_HEAD
+
+          echo "KernelSU Next revision:"
+          git -C KernelSU-Next rev-parse HEAD
+
+      - name: Apply Linux 4.4 compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
+
+          echo "Checking compatibility patch..."
+          git apply --check "$PATCH"
+
+          echo "Applying compatibility patch..."
+          git apply "$PATCH"
+
+      - name: Apply manual kernel hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="reference/patches/manual-hooks-linux-4.4.diff"
+
+          echo "Checking manual hook patch..."
+          git apply --check "$PATCH"
+
+          echo "Applying manual hook patch..."
+          git apply "$PATCH"
+
+      - name: Apply remaining KernelSU build fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PATCH="reference/patches/post-kernelsu.diff"
+
+          echo "Checking remaining KernelSU fixes..."
+
+          git apply --check \
+            --exclude='arch/arm64/configs/*joan*' \
+            "$PATCH"
+
+          echo "Applying remaining KernelSU fixes..."
+
+          git apply \
+            --exclude='arch/arm64/configs/*joan*' \
+            "$PATCH"
+
+      - name: Enable KernelSU Next in OnePlus 5 defconfig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("arch/arm64/configs/lineage_oneplus5_defconfig")
+          text = path.read_text()
+
+          options = [
+              r"(?m)^CONFIG_KSU=.*\n?",
+              r"(?m)^CONFIG_KSU_MANUAL_HOOK=.*\n?",
+              r"(?m)^# CONFIG_KSU_MANUAL_HOOK is not set\n?",
+              r"(?m)^CONFIG_KSU_KPROBES_HOOK=.*\n?",
+              r"(?m)^# CONFIG_KSU_KPROBES_HOOK is not set\n?",
+          ]
+
+          for pattern in options:
+              text = re.sub(pattern, "", text)
+
+          text = text.rstrip() + """
+
+          # KernelSU Next legacy manual hooks
+          CONFIG_KSU=y
+          CONFIG_KSU_MANUAL_HOOK=y
+          # CONFIG_KSU_KPROBES_HOOK is not set
+          """
+
+          path.write_text(text)
+          print("Updated OnePlus 5 defconfig.")
+          PY
+
+      - name: Validate all manual hook call sites
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_hook() {
+            local file="$1"
+            local hook="$2"
+
+            if ! grep -q "$hook" "$file"; then
+              echo "::error::Missing $hook in $file"
+              exit 1
+            fi
+
+            echo "Verified $hook in $file"
+          }
+
+          require_hook fs/exec.c ksu_handle_execveat
+          require_hook fs/open.c ksu_handle_faccessat
+          require_hook fs/read_write.c ksu_handle_vfs_read
+
+          require_hook fs/stat.c ksu_handle_stat
+          require_hook fs/stat.c ksu_handle_newfstat_ret
+          require_hook fs/stat.c ksu_handle_fstat64_ret
+
+          require_hook kernel/sys.c ksu_handle_setresuid
+          require_hook kernel/reboot.c ksu_handle_sys_reboot
+
+          require_hook security/selinux/hooks.c is_ksu_transition
+          require_hook KernelSU-Next/kernel/selinux/selinux.c is_ksu_transition
+
+          echo "All required manual hook references are present."
+
+      - name: Validate KernelSU configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generating OnePlus 5 configuration..."
+
+          make ARCH=arm64 lineage_oneplus5_defconfig
+          make ARCH=arm64 olddefconfig
+
+          grep -qx 'CONFIG_KSU=y' .config
+          grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' .config
+
+          if grep -qx 'CONFIG_KSU_KPROBES_HOOK=y' .config; then
+            echo "::error::KPROBES hook mode must be disabled."
+            exit 1
+          fi
+
+          echo "Verified KernelSU configuration:"
+          grep -E 'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=' .config || true
+
+      - name: Check patch formatting and source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --check
+
+          echo "Changed files:"
+          git status --short
+
+          echo "Change summary:"
+          git diff --stat
+
+          if git diff --quiet; then
+            echo "::error::No source changes were produced."
+            exit 1
+          fi
+
+      - name: Commit KernelSU Next integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+          git diff --cached --check
+
+          git commit -m "Integrate KernelSU Next legacy manual hooks"
+
+          echo "Pushing validated integration to lineage-22.2..."
+          git push origin HEAD:refs/heads/lineage-22.2
+
+      - name: Create integration report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "KernelSU Next OnePlus 5 integration"
+            echo
+            echo "Kernel branch: lineage-22.2"
+            echo "Target: OnePlus 5, cheeseburger, MSM8998"
+            echo "Kernel: Linux 4.4.302"
+            echo
+            echo "Reference patch revision:"
+            git -C reference rev-parse HEAD 2>/dev/null || true
+            echo
+            echo "KernelSU Next revision:"
+            git -C KernelSU-Next rev-parse HEAD 2>/dev/null || true
+            echo
+            echo "Latest kernel commit:"
+            git log -1 --oneline
+            echo
+            echo "Working tree:"
+            git status --short
+          } > kernelsu-next-integration-report.txt
+
+      - name: Upload integration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-next-oneplus5-integration-report
+          path: kernelsu-next-integration-report.txt
+          if-no-files-found: warn
