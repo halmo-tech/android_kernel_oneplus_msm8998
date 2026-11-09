@@ -1,0 +1,200 @@
+
+name: OnePlus 5 KernelSU Next Final Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          ref: lineage-22.2
+
+      - name: Integrate KernelSU Next source for inspection
+        shell: bash
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+      - name: Audit remaining manual hook requirements
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path(".")
+          output = []
+
+          def heading(text):
+              output.append("\n" + "=" * 78)
+              output.append(text)
+              output.append("=" * 78)
+
+          def show_file(path, terms, before=8, after=18):
+              path = Path(path)
+              heading(str(path))
+
+              if not path.exists():
+                  output.append("FILE NOT FOUND")
+                  return
+
+              lines = path.read_text(errors="replace").splitlines()
+              matches = []
+
+              for i, line in enumerate(lines):
+                  if any(term in line for term in terms):
+                      start = max(0, i - before)
+                      end = min(len(lines), i + after + 1)
+                      matches.append((start, end))
+
+              if not matches:
+                  output.append("No matching lines found.")
+                  return
+
+              merged = []
+              for start, end in matches:
+                  if merged and start <= merged[-1][1]:
+                      merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                  else:
+                      merged.append((start, end))
+
+              for start, end in merged:
+                  output.append(f"\n--- Lines {start + 1} to {end} ---")
+                  for n in range(start, end):
+                      output.append(f"{n + 1}: {lines[n]}")
+
+          output.append("DEVICE: OnePlus 5 (cheeseburger)")
+          output.append("BRANCH: lineage-22.2")
+          output.append("KERNEL: Linux 4.4.302")
+
+          show_file(
+              "KernelSU-Next/kernel/runtime/ksud_integration.c",
+              [
+                  "ksu_handle_execve_ksud",
+                  "ksu_handle_compat_execve_ksud",
+                  "ksu_handle_execveat_ksud",
+                  "ksu_handle_vfs_read",
+                  "ksu_handle_newfstat_ret",
+                  "ksu_handle_fstat64_ret",
+                  "ksu_handle_sys_read",
+                  "ksu_execveat_hook",
+                  "ksu_vfs_read_hook"
+              ],
+              12, 24
+          )
+
+          show_file(
+              "KernelSU-Next/kernel/core/init.c",
+              [
+                  "ksu_handle_execveat",
+                  "ksu_handle_execveat_sucompat"
+              ],
+              10, 20
+          )
+
+          show_file(
+              "KernelSU-Next/kernel/feature/sucompat.c",
+              [
+                  "ksu_handle_faccessat",
+                  "ksu_handle_stat",
+                  "ksu_handle_execveat_sucompat"
+              ],
+              10, 22
+          )
+
+          show_file(
+              "KernelSU-Next/kernel/feature/sucompat.h",
+              [
+                  "ksu_handle_faccessat",
+                  "ksu_handle_stat",
+                  "ksu_handle_execve"
+              ],
+              5, 12
+          )
+
+          show_file(
+              "KernelSU-Next/kernel/supercall/supercall.c",
+              ["ksu_handle_sys_reboot"],
+              10, 24
+          )
+
+          show_file(
+              "fs/exec.c",
+              [
+                  "do_execve(",
+                  "compat_do_execve(",
+                  "do_execveat(",
+                  "SYSCALL_DEFINE3(execve",
+                  "SYSCALL_DEFINE5(execveat",
+                  "COMPAT_SYSCALL_DEFINE3(execve"
+              ],
+              8, 22
+          )
+
+          show_file(
+              "fs/open.c",
+              ["SYSCALL_DEFINE3(faccessat"],
+              8, 24
+          )
+
+          show_file(
+              "fs/read_write.c",
+              ["ssize_t vfs_read(", "SYSCALL_DEFINE3(read"],
+              8, 24
+          )
+
+          show_file(
+              "fs/stat.c",
+              [
+                  "SYSCALL_DEFINE4(newfstatat",
+                  "SYSCALL_DEFINE2(newlstat",
+                  "SYSCALL_DEFINE2(newfstat",
+                  "SYSCALL_DEFINE4(fstatat64",
+                  "ksu_handle_newfstat_ret",
+                  "ksu_handle_fstat64_ret"
+              ],
+              8, 24
+          )
+
+          show_file(
+              "kernel/reboot.c",
+              ["SYSCALL_DEFINE4(reboot"],
+              8, 24
+          )
+
+          show_file(
+              "arch/arm64/configs/lineage_oneplus5_defconfig",
+              ["CONFIG_KSU", "CONFIG_KPROBES", "CONFIG_MODULES"],
+              3, 8
+          )
+
+          heading("KERNELSU CONFIGURATION")
+          for path in [
+              Path("KernelSU-Next/kernel/Kconfig"),
+              Path("KernelSU-Next/kernel/runtime/Kconfig"),
+              Path("KernelSU-Next/kernel/feature/Kconfig")
+          ]:
+              if path.exists():
+                  show_file(path, ["config KSU", "KSU_MANUAL_HOOK"], 3, 12)
+
+          heading("AUDIT COMPLETION")
+          output.append("Inspection only. No kernel source files were modified.")
+
+          report = "\n".join(output)
+          Path("kernelsu-final-audit.txt").write_text(report)
+          print(report)
+          PY
+
+      - name: Upload audit report
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus5-kernelsu-final-audit
+          path: kernelsu-final-audit.txt
+          if-no-files-found: error
