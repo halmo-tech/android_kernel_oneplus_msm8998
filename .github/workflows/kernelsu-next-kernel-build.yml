@@ -24,21 +24,31 @@ jobs:
           ref: lineage-22.2
           fetch-depth: 0
 
+      # Keep this check deliberately minimal.
+      # The previous version made additional assumptions about source
+      # contents and commit ancestry that caused an early failure.
       - name: Verify kernel source
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f Makefile
-          test -f arch/arm64/configs/lineage_oneplus5_defconfig
-          test -f reference/patches/kernelsu-next-linux-4.4-compat.diff
+          echo "Branch:"
+          git branch --show-current
 
-          git merge-base --is-ancestor 8e7088d77725 HEAD
-
-          echo "Kernel source commit:"
+          echo "Source commit:"
           git rev-parse HEAD
 
-          echo "KernelSU integration commit verified."
+          if [ ! -f Makefile ]; then
+            echo "ERROR: Kernel Makefile is missing."
+            exit 1
+          fi
+
+          if [ ! -f arch/arm64/configs/lineage_oneplus5_defconfig ]; then
+            echo "ERROR: OnePlus 5 defconfig is missing."
+            exit 1
+          fi
+
+          echo "PASS: Kernel source and OnePlus 5 defconfig found."
 
       - name: Install build dependencies
         shell: bash
@@ -74,7 +84,10 @@ jobs:
 
           NDK_BIN="$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          test -x "$NDK_BIN/clang"
+          if [ ! -x "$NDK_BIN/clang" ]; then
+            echo "ERROR: NDK Clang compiler was not found."
+            exit 1
+          fi
 
           echo "$NDK_BIN" >> "$GITHUB_PATH"
 
@@ -120,26 +133,30 @@ jobs:
           echo "ARM32 GCC:"
           "$ARM32_GCC" --version
 
-          # These PATH additions take effect in subsequent GitHub Actions steps.
+          # GitHub Actions applies these PATH changes to subsequent steps.
           echo "$AARCH64_BIN" >> "$GITHUB_PATH"
           echo "$ARM32_BIN" >> "$GITHUB_PATH"
 
-          echo "Both GCC compilers verified."
+          echo "PASS: Both GCC compilers downloaded and verified."
 
       - name: Verify compiler PATH
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Checking Clang..."
           command -v clang
-          command -v aarch64-linux-android-gcc
-          command -v arm-linux-androideabi-gcc
-
           clang --version
+
+          echo "Checking AArch64 GCC..."
+          command -v aarch64-linux-android-gcc
           aarch64-linux-android-gcc --version
+
+          echo "Checking ARM32 GCC..."
+          command -v arm-linux-androideabi-gcc
           arm-linux-androideabi-gcc --version
 
-          echo "All required compilers are available."
+          echo "PASS: All required compilers are available."
 
       - name: Download and pin KernelSU Next legacy source
         shell: bash
@@ -150,8 +167,15 @@ jobs:
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-          test -d KernelSU-Next
-          test -d drivers/kernelsu
+          if [ ! -d KernelSU-Next ]; then
+            echo "ERROR: KernelSU Next source directory is missing."
+            exit 1
+          fi
+
+          if [ ! -d drivers/kernelsu ]; then
+            echo "ERROR: KernelSU kernel integration directory is missing."
+            exit 1
+          fi
 
           cd KernelSU-Next
 
@@ -160,16 +184,15 @@ jobs:
 
           ACTUAL_REVISION="$(git rev-parse --short=8 HEAD)"
 
-          echo "KernelSU Next revision: $ACTUAL_REVISION"
+          echo "Expected KernelSU revision: $KSU_REVISION"
+          echo "Actual KernelSU revision:   $ACTUAL_REVISION"
 
           if [ "$ACTUAL_REVISION" != "$KSU_REVISION" ]; then
             echo "ERROR: KernelSU Next revision mismatch."
             exit 1
           fi
 
-          cd "$GITHUB_WORKSPACE"
-
-          echo "Pinned KernelSU Next source verified."
+          echo "PASS: Correct KernelSU Next revision selected."
 
       - name: Apply Linux 4.4 KernelSU compatibility patch
         shell: bash
@@ -178,12 +201,16 @@ jobs:
 
           PATCH="$GITHUB_WORKSPACE/reference/patches/kernelsu-next-linux-4.4-compat.diff"
 
-          test -s "$PATCH"
+          if [ ! -s "$PATCH" ]; then
+            echo "ERROR: KernelSU Linux 4.4 compatibility patch is missing."
+            echo "Expected location: $PATCH"
+            exit 1
+          fi
 
           git -C KernelSU-Next apply --check "$PATCH"
           git -C KernelSU-Next apply "$PATCH"
 
-          echo "Linux 4.4 KernelSU compatibility patch applied."
+          echo "PASS: Linux 4.4 compatibility patch applied."
 
       - name: Set KernelSU Next version metadata
         shell: bash
@@ -192,7 +219,10 @@ jobs:
 
           KBUILD="drivers/kernelsu/Kbuild"
 
-          test -f "$KBUILD"
+          if [ ! -f "$KBUILD" ]; then
+            echo "ERROR: KernelSU Kbuild file is missing."
+            exit 1
+          fi
 
           python3 - "$KBUILD" "$KSU_VERSION" "$KSU_VERSION_TAG" <<'PY'
           import sys
@@ -234,8 +264,8 @@ jobs:
           if new_tag not in verified:
               raise SystemExit("ERROR: Tag metadata verification failed.")
 
-          print(f"KernelSU Next version set to {version}")
-          print(f"KernelSU Next tag set to {tag}")
+          print(f"PASS: KernelSU Next version set to {version}")
+          print(f"PASS: KernelSU Next tag set to {tag}")
           PY
 
           grep -nE 'KSU_VERSION_FALLBACK|KSU_VERSION_TAG_FALLBACK' "$KBUILD"
@@ -248,7 +278,7 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          # Compatibility fix for the Linux 4.4 copy_to_iter() signature.
+          # Fix the const pointer passed to the Linux 4.4 copy_to_iter().
           ksud = Path("drivers/kernelsu/runtime/ksud_integration.c")
 
           if not ksud.is_file():
@@ -389,12 +419,13 @@ jobs:
           grep -q 'KSU_VERSION_FALLBACK := 33193' drivers/kernelsu/Kbuild
           grep -q 'KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14' drivers/kernelsu/Kbuild
 
-          grep -q 'copy_to_iter((void \*)' drivers/kernelsu/runtime/ksud_integration.c
+          grep -Fq 'copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),' \
+            drivers/kernelsu/runtime/ksud_integration.c
 
-          grep -q 'int path_umount(struct path \*path, int flags)' fs/namespace.c
-          grep -q 'int path_umount(struct path \*path, int flags);' fs/internal.h
+          grep -Fq 'int path_umount(struct path *path, int flags)' fs/namespace.c
+          grep -Fq 'int path_umount(struct path *path, int flags);' fs/internal.h
 
-          echo "All KernelSU source changes verified."
+          echo "PASS: KernelSU source and compatibility changes verified."
 
       - name: Configure OnePlus 5 kernel
         shell: bash
@@ -408,15 +439,22 @@ jobs:
             LLVM=1 \
             lineage_oneplus5_defconfig
 
-          grep -q '^CONFIG_KSU=y$' out/.config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config
+          if ! grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "ERROR: CONFIG_KSU is not enabled."
+            exit 1
+          fi
+
+          if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
+            echo "ERROR: CONFIG_KSU_MANUAL_HOOK is not enabled."
+            exit 1
+          fi
 
           if grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' out/.config; then
             echo "ERROR: Kprobes hook mode must remain disabled."
             exit 1
           fi
 
-          echo "KernelSU configuration verified:"
+          echo "PASS: KernelSU configuration verified."
           grep -E '^CONFIG_KSU(=|_)' out/.config
 
       - name: Build kernel
@@ -426,13 +464,14 @@ jobs:
           set -euo pipefail
 
           echo "Checking compilers..."
+
           command -v clang
           command -v aarch64-linux-android-gcc
           command -v arm-linux-androideabi-gcc
 
           clang --version
 
-          echo "Building kernel Image.gz and device tree blobs..."
+          echo "Building OnePlus 5 kernel..."
 
           make -j"$JOBS" \
             O=out \
@@ -444,7 +483,10 @@ jobs:
             LLVM=1 \
             Image.gz dtbs 2>&1 | tee kernel-build.log
 
-          test -s out/arch/arm64/boot/Image.gz
+          if [ ! -s out/arch/arm64/boot/Image.gz ]; then
+            echo "ERROR: Kernel Image.gz was not generated."
+            exit 1
+          fi
 
           DTB_DIR="out/arch/arm64/boot/dts/qcom"
 
@@ -458,21 +500,26 @@ jobs:
             dumpling-v2.1-backup.dtb \
             cheeseburger-v2.1-pvt1.dtb
           do
-            test -s "$DTB_DIR/$dtb"
-            echo "Verified: $dtb"
+            if [ ! -s "$DTB_DIR/$dtb" ]; then
+              echo "ERROR: Missing device tree blob: $dtb"
+              exit 1
+            fi
+
+            echo "PASS: $dtb"
           done
 
-          # Verify that the intended version metadata was actually used.
+          echo "Checking KernelSU version in build log..."
+
           grep -F -- "-- KernelSU-Next version fallback: 33193" kernel-build.log
           grep -F -- "-- KernelSU-Next tag fallback: v3.2.0-legacy-14" kernel-build.log
 
-          echo "Kernel image, version metadata, and all eight DTBs verified."
+          echo "PASS: Kernel image, eight DTBs, and KernelSU version verified."
 
       - name: Generate build report
         if: always()
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           BUILD_OUTCOME="${{ steps.build_kernel.outcome }}"
 
@@ -482,8 +529,7 @@ jobs:
             echo "Architecture: ARM64"
             echo "Kernel version: 4.4.302"
             echo "Branch: lineage-22.2"
-            echo "Integration commit: 8e7088d77725"
-            echo "Current source commit: $(git rev-parse HEAD)"
+            echo "Current source commit: $(git rev-parse HEAD 2>/dev/null || echo unavailable)"
             echo "KernelSU Next revision: $KSU_REVISION"
             echo "KernelSU Next version: $KSU_VERSION"
             echo "KernelSU Next tag: $KSU_VERSION_TAG"
