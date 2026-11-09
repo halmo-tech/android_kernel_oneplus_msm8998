@@ -1,0 +1,114 @@
+name: KernelSU Final Source Inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout OnePlus 5 kernel
+        uses: actions/checkout@v5
+        with:
+          ref: lineage-22.2
+
+      - name: Integrate KernelSU Next legacy source
+        shell: bash
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+      - name: Inspect exact hook locations
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          def extract(path, marker, max_lines=180):
+              p = Path(path)
+              print("\n" + "=" * 78)
+              print(f"FILE: {path}")
+              print(f"FUNCTION MARKER: {marker}")
+              print("=" * 78)
+
+              if not p.exists():
+                  print("FILE NOT FOUND")
+                  return
+
+              lines = p.read_text(errors="replace").splitlines()
+              start = next((i for i, line in enumerate(lines)
+                            if marker in line), None)
+
+              if start is None:
+                  print("MARKER NOT FOUND")
+                  return
+
+              brace_started = False
+              depth = 0
+              end = start
+
+              for i in range(start, len(lines)):
+                  line = lines[i]
+                  for char in line:
+                      if char == "{":
+                          depth += 1
+                          brace_started = True
+                      elif char == "}":
+                          depth -= 1
+
+                  end = i
+                  if brace_started and depth == 0:
+                      break
+
+                  if i - start >= max_lines:
+                      break
+
+              for i in range(start, end + 1):
+                  print(f"{i + 1}: {lines[i]}")
+
+          # KernelSU manual hook locations
+          extract("fs/exec.c", "static int do_execveat_common")
+          extract("fs/open.c", "SYSCALL_DEFINE3(faccessat")
+          extract("fs/read_write.c", "ssize_t vfs_read")
+          extract("fs/stat.c", "SYSCALL_DEFINE4(newfstatat")
+          extract("fs/stat.c", "SYSCALL_DEFINE2(newfstat")
+          extract("fs/stat.c", "SYSCALL_DEFINE2(fstat64")
+          extract("fs/stat.c", "SYSCALL_DEFINE4(fstatat64")
+          extract("kernel/reboot.c", "SYSCALL_DEFINE4(reboot")
+          extract("kernel/sys.c", "SYSCALL_DEFINE3(setresuid")
+
+          # SELinux transition check
+          extract("security/selinux/hooks.c", "static int check_nnp_nosuid")
+
+          # KernelSU handler definitions and declarations
+          extract("KernelSU-Next/kernel/core/init.c", "int ksu_handle_execveat(")
+          extract("KernelSU-Next/kernel/hook/setuid_hook.c", "int ksu_handle_setresuid(")
+          extract("KernelSU-Next/kernel/selinux/selinux.c", "bool __maybe_unused")
+          PY
+
+      - name: Find SELinux transition references
+        shell: bash
+        run: |
+          echo "===== is_ksu_transition references ====="
+          git grep -n "is_ksu_transition" || true
+
+          echo
+          echo "===== KernelSU manual hook references ====="
+          git grep -n -E "ksu_handle_(execveat|faccessat|vfs_read|stat|newfstat_ret|fstat64_ret|sys_reboot|setresuid)" -- \
+            fs kernel security KernelSU-Next || true
+
+          echo
+          echo "===== KernelSU configuration ====="
+          grep -n -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES" \
+            arch/arm64/configs/lineage_oneplus5_defconfig || true
+
+      - name: Upload inspection report
+        uses: actions/upload-artifact@v6
+        with:
+          name: oneplus5-kernelsu-final-source-inspection
+          path: |
+            arch/arm64/configs/lineage_oneplus5_defconfig
+          if-no-files-found: error
