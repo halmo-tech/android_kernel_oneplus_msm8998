@@ -21,89 +21,103 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-      - name: Inspect exact hook locations
+      - name: Print exact kernel source sections
         shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
 
-          def extract(path, marker, max_lines=180):
-              p = Path(path)
+          sections = [
+              ("kernel/sys.c", 580, 650),
+              ("fs/exec.c", 1530, 1678),
+              ("fs/open.c", 340, 365),
+              ("fs/read_write.c", 435, 465),
+              ("fs/stat.c", 270, 315),
+              ("fs/stat.c", 400, 445),
+              ("kernel/reboot.c", 275, 320),
+              ("security/selinux/hooks.c", 2260, 2305),
+          ]
+
+          for filename, first, last in sections:
+              path = Path(filename)
               print("\n" + "=" * 78)
-              print(f"FILE: {path}")
-              print(f"FUNCTION MARKER: {marker}")
+              print(f"{filename}, lines {first}-{last}")
               print("=" * 78)
 
-              if not p.exists():
+              if not path.exists():
                   print("FILE NOT FOUND")
-                  return
+                  continue
 
-              lines = p.read_text(errors="replace").splitlines()
-              start = next((i for i, line in enumerate(lines)
-                            if marker in line), None)
+              lines = path.read_text(errors="replace").splitlines()
 
-              if start is None:
-                  print("MARKER NOT FOUND")
-                  return
-
-              brace_started = False
-              depth = 0
-              end = start
-
-              for i in range(start, len(lines)):
-                  line = lines[i]
-                  for char in line:
-                      if char == "{":
-                          depth += 1
-                          brace_started = True
-                      elif char == "}":
-                          depth -= 1
-
-                  end = i
-                  if brace_started and depth == 0:
-                      break
-
-                  if i - start >= max_lines:
-                      break
-
-              for i in range(start, end + 1):
-                  print(f"{i + 1}: {lines[i]}")
-
-          # KernelSU manual hook locations
-          extract("fs/exec.c", "static int do_execveat_common")
-          extract("fs/open.c", "SYSCALL_DEFINE3(faccessat")
-          extract("fs/read_write.c", "ssize_t vfs_read")
-          extract("fs/stat.c", "SYSCALL_DEFINE4(newfstatat")
-          extract("fs/stat.c", "SYSCALL_DEFINE2(newfstat")
-          extract("fs/stat.c", "SYSCALL_DEFINE2(fstat64")
-          extract("fs/stat.c", "SYSCALL_DEFINE4(fstatat64")
-          extract("kernel/reboot.c", "SYSCALL_DEFINE4(reboot")
-          extract("kernel/sys.c", "SYSCALL_DEFINE3(setresuid")
-
-          # SELinux transition check
-          extract("security/selinux/hooks.c", "static int check_nnp_nosuid")
-
-          # KernelSU handler definitions and declarations
-          extract("KernelSU-Next/kernel/core/init.c", "int ksu_handle_execveat(")
-          extract("KernelSU-Next/kernel/hook/setuid_hook.c", "int ksu_handle_setresuid(")
-          extract("KernelSU-Next/kernel/selinux/selinux.c", "bool __maybe_unused")
+              for number in range(first, min(last, len(lines)) + 1):
+                  print(f"{number}: {lines[number - 1]}")
           PY
 
-      - name: Find SELinux transition references
+      - name: Search KernelSU source and hook references
         shell: bash
         run: |
-          echo "===== is_ksu_transition references ====="
-          git grep -n "is_ksu_transition" || true
+          python3 <<'PY'
+          from pathlib import Path
 
-          echo
-          echo "===== KernelSU manual hook references ====="
-          git grep -n -E "ksu_handle_(execveat|faccessat|vfs_read|stat|newfstat_ret|fstat64_ret|sys_reboot|setresuid)" -- \
-            fs kernel security KernelSU-Next || true
+          roots = [
+              Path("KernelSU-Next"),
+              Path("kernel"),
+              Path("fs"),
+              Path("security"),
+          ]
 
-          echo
-          echo "===== KernelSU configuration ====="
+          terms = [
+              "is_ksu_transition",
+              "ksu_handle_execveat",
+              "ksu_handle_faccessat",
+              "ksu_handle_vfs_read",
+              "ksu_handle_stat",
+              "ksu_handle_newfstat_ret",
+              "ksu_handle_fstat64_ret",
+              "ksu_handle_sys_reboot",
+              "ksu_handle_setresuid",
+              "ksu_handle_execveat_sucompat",
+          ]
+
+          for root in roots:
+              if not root.exists():
+                  continue
+
+              for path in root.rglob("*"):
+                  if not path.is_file():
+                      continue
+                  if path.suffix not in {".c", ".h"}:
+                      continue
+
+                  try:
+                      lines = path.read_text(errors="replace").splitlines()
+                  except Exception:
+                      continue
+
+                  matches = []
+                  for number, line in enumerate(lines, 1):
+                      if any(term in line for term in terms):
+                          matches.append((number, line))
+
+                  if matches:
+                      print("\n" + "=" * 78)
+                      print(path)
+                      print("=" * 78)
+                      for number, line in matches:
+                          print(f"{number}: {line}")
+          PY
+
+      - name: Inspect KernelSU configuration
+        shell: bash
+        run: |
+          echo "===== OnePlus 5 defconfig ====="
           grep -n -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES" \
             arch/arm64/configs/lineage_oneplus5_defconfig || true
+
+          echo
+          echo "===== KernelSU Kconfig ====="
+          find KernelSU-Next -name Kconfig -o -name Kconfig.*
 
       - name: Upload inspection report
         uses: actions/upload-artifact@v6
