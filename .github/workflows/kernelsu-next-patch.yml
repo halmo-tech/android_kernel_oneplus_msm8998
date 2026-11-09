@@ -1,4 +1,4 @@
-name: KernelSU Next OnePlus 5 Patch
+name: KernelSU Next OnePlus 5 Integration
 
 on:
   workflow_dispatch:
@@ -7,11 +7,11 @@ permissions:
   contents: write
 
 concurrency:
-  group: kernelsu-next-oneplus5-patch
+  group: kernelsu-next-oneplus5-integration
   cancel-in-progress: false
 
 jobs:
-  patch:
+  integrate:
     name: Integrate and validate KernelSU Next
     runs-on: ubuntu-latest
 
@@ -22,14 +22,27 @@ jobs:
           ref: lineage-22.2
           fetch-depth: 0
 
-      - name: Checkout Linux 4.4 reference patches
+      - name: Install build configuration dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev
+
+      - name: Checkout reference patches
         uses: actions/checkout@v4
         with:
           repository: TosteRino/joan-kernelsu
           ref: main
           path: reference
 
-      - name: Check target kernel and reference patches
+      - name: Verify OnePlus 5 kernel source
         shell: bash
         run: |
           set -euo pipefail
@@ -44,22 +57,27 @@ jobs:
           test -f kernel/reboot.c
           test -f security/selinux/hooks.c
 
-          grep -q 'VERSION = 4' Makefile
-          grep -q 'PATCHLEVEL = 4' Makefile
-          grep -q 'SUBLEVEL = 302' Makefile
+          grep -q '^VERSION = 4$' Makefile
+          grep -q '^PATCHLEVEL = 4$' Makefile
+          grep -q '^SUBLEVEL = 302$' Makefile
+
+          echo "Verified Linux 4.4.302 OnePlus 5 kernel."
+
+      - name: Verify required reference patches
+        shell: bash
+        run: |
+          set -euo pipefail
 
           for patch in \
             reference/patches/kernelsu-next-linux-4.4-compat.diff \
-            reference/patches/manual-hooks-linux-4.4.diff \
-            reference/patches/post-kernelsu.diff
+            reference/patches/manual-hooks-linux-4.4.diff
           do
             test -s "$patch"
             echo "Found: $patch"
             sha256sum "$patch"
           done
 
-          echo "Reference repository revision:"
-          git -C reference rev-parse HEAD
+          echo "The Joan-specific post-kernelsu.diff is intentionally excluded."
 
       - name: Integrate KernelSU Next legacy source
         shell: bash
@@ -72,36 +90,35 @@ jobs:
 
           test -d KernelSU-Next
           test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Makefile
 
-      - name: Checkout reference-compatible KernelSU revision
+          echo "KernelSU Next source integration completed."
+
+      - name: Pin KernelSU Next to reference revision
         shell: bash
         run: |
           set -euo pipefail
 
           cd KernelSU-Next
 
-          echo "Checking whether the required commit is available..."
-
           if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-            echo "Fetching full legacy branch history..."
+            echo "Fetching complete legacy branch history..."
             git fetch --unshallow origin legacy
           fi
 
           if ! git cat-file -e 'a54e4fa4^{commit}' 2>/dev/null; then
-            echo "Fetching legacy branch history..."
             git fetch origin legacy
           fi
 
-          if ! git cat-file -e 'a54e4fa4^{commit}' 2>/dev/null; then
-            echo "::error::Required KernelSU commit a54e4fa4 is not available."
-            exit 1
-          fi
+          git cat-file -e 'a54e4fa4^{commit}'
 
           git checkout --detach a54e4fa4
 
-          echo "Selected KernelSU Next revision:"
-          git rev-parse HEAD
+          KSU_REVISION="$(git rev-parse HEAD)"
 
+          echo "KSU_REVISION=$KSU_REVISION" >> "$GITHUB_ENV"
+
+          echo "Selected KernelSU Next revision:"
           git log -1 --oneline
 
       - name: Apply Linux 4.4 compatibility patch
@@ -109,37 +126,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
+          PATCH="$GITHUB_WORKSPACE/reference/patches/kernelsu-next-linux-4.4-compat.diff"
 
-          git apply --check "$PATCH"
-          git apply "$PATCH"
+          echo "Checking compatibility patch inside KernelSU Next..."
 
-      - name: Apply manual kernel hooks
+          git -C KernelSU-Next apply --check "$PATCH"
+
+          echo "Applying compatibility patch..."
+
+          git -C KernelSU-Next apply "$PATCH"
+
+          echo "Compatibility patch applied successfully."
+
+      - name: Apply OnePlus 5 manual kernel hooks
         shell: bash
         run: |
           set -euo pipefail
 
           PATCH="reference/patches/manual-hooks-linux-4.4.diff"
 
+          echo "Checking manual hook patch against OnePlus 5 kernel..."
+
           git apply --check "$PATCH"
+
+          echo "Applying manual hooks..."
+
           git apply "$PATCH"
 
-      - name: Apply remaining KernelSU build fixes
-        shell: bash
-        run: |
-          set -euo pipefail
+          echo "Manual hook patch applied successfully."
 
-          PATCH="reference/patches/post-kernelsu.diff"
-
-          git apply --check \
-            --exclude='arch/arm64/configs/*joan*' \
-            "$PATCH"
-
-          git apply \
-            --exclude='arch/arm64/configs/*joan*' \
-            "$PATCH"
-
-      - name: Enable KernelSU Next in OnePlus 5 defconfig
+      - name: Enable KernelSU Next manual hooks
         shell: bash
         run: |
           set -euo pipefail
@@ -148,7 +164,10 @@ jobs:
           from pathlib import Path
           import re
 
-          path = Path("arch/arm64/configs/lineage_oneplus5_defconfig")
+          path = Path(
+              "arch/arm64/configs/lineage_oneplus5_defconfig"
+          )
+
           text = path.read_text()
 
           options = [
@@ -171,10 +190,11 @@ jobs:
           """
 
           path.write_text(text)
-          print("Updated OnePlus 5 defconfig.")
+
+          print("OnePlus 5 defconfig updated.")
           PY
 
-      - name: Validate all manual hook call sites
+      - name: Validate manual hook references
         shell: bash
         run: |
           set -euo pipefail
@@ -203,7 +223,10 @@ jobs:
           require_hook kernel/reboot.c ksu_handle_sys_reboot
 
           require_hook security/selinux/hooks.c is_ksu_transition
-          require_hook KernelSU-Next/kernel/selinux/selinux.c is_ksu_transition
+
+          require_hook \
+            KernelSU-Next/kernel/selinux/selinux.c \
+            is_ksu_transition
 
           echo "All required manual hook references are present."
 
@@ -213,6 +236,7 @@ jobs:
           set -euo pipefail
 
           make ARCH=arm64 lineage_oneplus5_defconfig
+
           make ARCH=arm64 olddefconfig
 
           grep -qx 'CONFIG_KSU=y' .config
@@ -223,59 +247,128 @@ jobs:
             exit 1
           fi
 
-          grep -E 'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=' .config || true
+          echo "Validated KernelSU configuration:"
+          grep -E \
+            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=' \
+            .config || true
 
-      - name: Check patch formatting and source changes
+      - name: Verify KernelSU source and symlinks
         shell: bash
         run: |
           set -euo pipefail
 
-          git diff --check
-          git status --short
-          git diff --stat
+          test -f KernelSU-Next/kernel/Kconfig
+          test -f KernelSU-Next/kernel/Makefile
 
-          if git diff --quiet; then
-            echo "::error::No source changes were produced."
+          echo "Checking KernelSU Next symlinks..."
+
+          while IFS= read -r -d '' link; do
+            target="$(readlink "$link")"
+
+            if [[ "$target" == *KernelSU-Next* ]]; then
+              if [ ! -e "$link" ]; then
+                echo "::error::Broken KernelSU symlink: $link"
+                exit 1
+              fi
+
+              echo "Verified: $link -> $target"
+            fi
+          done < <(find . -type l -print0)
+
+      - name: Vendor KernelSU Next source into kernel repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Recording exact KernelSU Next revision:"
+          echo "$KSU_REVISION"
+
+          if [ -d KernelSU-Next/.git ] || [ -f KernelSU-Next/.git ]; then
+            rm -rf KernelSU-Next/.git
+          fi
+
+          if [ -e KernelSU-Next/.git ]; then
+            echo "::error::Nested Git metadata still exists."
             exit 1
           fi
 
-      - name: Commit KernelSU Next integration
+          echo "KernelSU Next Git metadata removed."
+          echo "Source files will be committed with the kernel."
+
+      - name: Stage and validate integration changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git add -A
+
+          git add -f -A KernelSU-Next
+
+          git diff --cached --check
+
+          git ls-files --error-unmatch \
+            KernelSU-Next/kernel/Kconfig
+
+          if git ls-files --stage KernelSU-Next \
+            | grep -q '^160000 '; then
+            echo "::error::KernelSU Next was staged as a Git submodule."
+            exit 1
+          fi
+
+          if git diff --cached --quiet; then
+            echo "::error::No integration changes were staged."
+            exit 1
+          fi
+
+          echo "Staged integration summary:"
+          git diff --cached --stat
+
+          echo "KernelSU Next source file count:"
+          git ls-files KernelSU-Next | wc -l
+
+      - name: Commit and push validated integration
         shell: bash
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A
-          git diff --cached --check
-
-          git commit -m "Integrate KernelSU Next legacy manual hooks"
+          git commit \
+            -m "Integrate KernelSU Next legacy manual hooks"
 
           git push origin HEAD:refs/heads/lineage-22.2
+
+          echo "Integration committed and pushed successfully."
 
       - name: Create integration report
         if: always()
         shell: bash
         run: |
           {
-            echo "KernelSU Next OnePlus 5 integration"
+            echo "KernelSU Next OnePlus 5 integration report"
             echo
-            echo "Kernel branch: lineage-22.2"
-            echo "Target: OnePlus 5, cheeseburger, MSM8998"
+            echo "Device: OnePlus 5, cheeseburger"
+            echo "Platform: Qualcomm MSM8998"
             echo "Kernel: Linux 4.4.302"
-            echo
-            echo "Reference repository revision:"
-            git -C reference rev-parse HEAD 2>/dev/null || true
+            echo "Branch: lineage-22.2"
             echo
             echo "KernelSU Next revision:"
-            git -C KernelSU-Next rev-parse HEAD 2>/dev/null || true
+            echo "${KSU_REVISION:-not selected}"
+            echo
+            echo "Patches used:"
+            echo "kernelsu-next-linux-4.4-compat.diff"
+            echo "manual-hooks-linux-4.4.diff"
+            echo
+            echo "Intentionally excluded:"
+            echo "post-kernelsu.diff, Joan-specific changes"
             echo
             echo "Latest kernel commit:"
-            git log -1 --oneline
+            git log -1 --oneline 2>/dev/null || true
             echo
             echo "Working tree:"
-            git status --short
+            git status --short 2>/dev/null || true
           } > kernelsu-next-integration-report.txt
 
       - name: Upload integration report
