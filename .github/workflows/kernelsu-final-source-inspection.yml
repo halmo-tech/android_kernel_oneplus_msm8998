@@ -8,53 +8,50 @@ permissions:
 
 jobs:
   inspect:
+    name: Inspect OnePlus 5 Kernel Sources
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout OnePlus 5 kernel
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
           ref: lineage-22.2
+          fetch-depth: 1
 
-      - name: Integrate KernelSU Next legacy source
-        shell: bash
-        run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-
-      - name: Print exact kernel source sections
+      - name: Inspect exact source locations
         shell: bash
         run: |
           python3 <<'PY'
           from pathlib import Path
 
-          sections = [
-              ("kernel/sys.c", 580, 650),
-              ("fs/exec.c", 1530, 1678),
-              ("fs/open.c", 340, 365),
-              ("fs/read_write.c", 435, 465),
-              ("fs/stat.c", 270, 315),
-              ("fs/stat.c", 400, 445),
-              ("kernel/reboot.c", 275, 320),
-              ("security/selinux/hooks.c", 2260, 2305),
-          ]
-
-          for filename, first, last in sections:
+          def show(filename, start, end):
               path = Path(filename)
-              print("\n" + "=" * 78)
-              print(f"{filename}, lines {first}-{last}")
+
+              print()
+              print("=" * 78)
+              print(f"{filename}, lines {start}-{end}")
               print("=" * 78)
 
               if not path.exists():
-                  print("FILE NOT FOUND")
-                  continue
+                  print(f"ERROR: File not found: {filename}")
+                  return
 
               lines = path.read_text(errors="replace").splitlines()
 
-              for number in range(first, min(last, len(lines)) + 1):
+              for number in range(start, min(end, len(lines)) + 1):
                   print(f"{number}: {lines[number - 1]}")
+
+          show("kernel/sys.c", 580, 650)
+          show("fs/exec.c", 1530, 1620)
+          show("fs/open.c", 340, 365)
+          show("fs/read_write.c", 435, 465)
+          show("fs/stat.c", 270, 315)
+          show("fs/stat.c", 400, 445)
+          show("kernel/reboot.c", 275, 320)
+          show("security/selinux/hooks.c", 2260, 2305)
           PY
 
-      - name: Search KernelSU source and hook references
+      - name: Search KernelSU hook declarations and references
         shell: bash
         run: |
           python3 <<'PY'
@@ -80,30 +77,35 @@ jobs:
               "ksu_handle_execveat_sucompat",
           ]
 
+          extensions = {".c", ".h"}
+
           for root in roots:
               if not root.exists():
+                  print(f"WARNING: Directory not found: {root}")
                   continue
 
-              for path in root.rglob("*"):
-                  if not path.is_file():
-                      continue
-                  if path.suffix not in {".c", ".h"}:
+              for path in sorted(root.rglob("*")):
+                  if not path.is_file() or path.suffix not in extensions:
                       continue
 
                   try:
                       lines = path.read_text(errors="replace").splitlines()
-                  except Exception:
+                  except Exception as error:
+                      print(f"Could not read {path}: {error}")
                       continue
 
                   matches = []
+
                   for number, line in enumerate(lines, 1):
                       if any(term in line for term in terms):
                           matches.append((number, line))
 
                   if matches:
-                      print("\n" + "=" * 78)
+                      print()
+                      print("=" * 78)
                       print(path)
                       print("=" * 78)
+
                       for number, line in matches:
                           print(f"{number}: {line}")
           PY
@@ -112,17 +114,38 @@ jobs:
         shell: bash
         run: |
           echo "===== OnePlus 5 defconfig ====="
-          grep -n -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KRETPROBES" \
-            arch/arm64/configs/lineage_oneplus5_defconfig || true
+          if [ -f arch/arm64/configs/lineage_oneplus5_defconfig ]; then
+            nl -ba arch/arm64/configs/lineage_oneplus5_defconfig
+          else
+            echo "ERROR: OnePlus 5 defconfig not found"
+          fi
 
           echo
           echo "===== KernelSU Kconfig ====="
-          find KernelSU-Next -name Kconfig -o -name Kconfig.*
+
+          if [ -f KernelSU-Next/kernel/Kconfig ]; then
+            nl -ba KernelSU-Next/kernel/Kconfig
+          else
+            echo "ERROR: KernelSU Kconfig not found"
+          fi
+
+          echo
+          echo "===== KernelSU integration status ====="
+
+          if [ -d KernelSU-Next ]; then
+            echo "KernelSU-Next directory exists"
+            git -C KernelSU-Next status --short 2>/dev/null || true
+          else
+            echo "KernelSU-Next directory does not exist"
+          fi
 
       - name: Upload inspection report
+        if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: oneplus5-kernelsu-final-source-inspection
+          name: oneplus5-kernelsu-source-inspection
           path: |
             arch/arm64/configs/lineage_oneplus5_defconfig
-          if-no-files-found: error
+            KernelSU-Next/kernel/Kconfig
+          if-no-files-found: warn
+          retention-days: 7
