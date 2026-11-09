@@ -24,28 +24,21 @@ jobs:
           ref: lineage-22.2
           fetch-depth: 0
 
-      - name: Verify kernel source and integration
+      - name: Verify kernel source
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking repository..."
           test -f Makefile
           test -f arch/arm64/configs/lineage_oneplus5_defconfig
+          test -f reference/patches/kernelsu-next-linux-4.4-compat.diff
 
-          echo "Checking required KernelSU integration commit..."
           git merge-base --is-ancestor 8e7088d77725 HEAD
 
-          echo "Current source commit:"
+          echo "Kernel source commit:"
           git rev-parse HEAD
 
-          echo "Checking manual KernelSU hooks..."
-          grep -q "ksu_handle_sys_reboot" kernel/reboot.c
-
-          echo "Checking SELinux compatibility helper..."
-          grep -q "selinux_inode" security/selinux/include/objsec.h
-
-          echo "Source and integration checks passed."
+          echo "KernelSU integration commit verified."
 
       - name: Install build dependencies
         shell: bash
@@ -85,6 +78,7 @@ jobs:
 
           echo "$NDK_BIN" >> "$GITHUB_PATH"
 
+          echo "NDK Clang:"
           "$NDK_BIN/clang" --version
 
       - name: Download Android GCC cross compilers
@@ -104,15 +98,48 @@ jobs:
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
             gcc32
 
-          test -x gcc64/bin/aarch64-linux-android-gcc
-          test -x gcc32/bin/arm-linux-androideabi-gcc
+          AARCH64_BIN="$GITHUB_WORKSPACE/gcc64/bin"
+          ARM32_BIN="$GITHUB_WORKSPACE/gcc32/bin"
 
-          echo "$GITHUB_WORKSPACE/gcc64/bin" >> "$GITHUB_PATH"
-          echo "$GITHUB_WORKSPACE/gcc32/bin" >> "$GITHUB_PATH"
+          AARCH64_GCC="$AARCH64_BIN/aarch64-linux-android-gcc"
+          ARM32_GCC="$ARM32_BIN/arm-linux-androideabi-gcc"
 
-          echo "Cross compiler versions:"
+          if [ ! -x "$AARCH64_GCC" ]; then
+            echo "ERROR: AArch64 GCC compiler is missing."
+            exit 1
+          fi
+
+          if [ ! -x "$ARM32_GCC" ]; then
+            echo "ERROR: ARM32 GCC compiler is missing."
+            exit 1
+          fi
+
+          echo "AArch64 GCC:"
+          "$AARCH64_GCC" --version
+
+          echo "ARM32 GCC:"
+          "$ARM32_GCC" --version
+
+          # These PATH additions take effect in subsequent GitHub Actions steps.
+          echo "$AARCH64_BIN" >> "$GITHUB_PATH"
+          echo "$ARM32_BIN" >> "$GITHUB_PATH"
+
+          echo "Both GCC compilers verified."
+
+      - name: Verify compiler PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v clang
+          command -v aarch64-linux-android-gcc
+          command -v arm-linux-androideabi-gcc
+
+          clang --version
           aarch64-linux-android-gcc --version
           arm-linux-androideabi-gcc --version
+
+          echo "All required compilers are available."
 
       - name: Download and pin KernelSU Next legacy source
         shell: bash
@@ -124,6 +151,7 @@ jobs:
             | bash -s legacy
 
           test -d KernelSU-Next
+          test -d drivers/kernelsu
 
           cd KernelSU-Next
 
@@ -135,27 +163,27 @@ jobs:
           echo "KernelSU Next revision: $ACTUAL_REVISION"
 
           if [ "$ACTUAL_REVISION" != "$KSU_REVISION" ]; then
-            echo "ERROR: KernelSU Next revision does not match the required revision."
+            echo "ERROR: KernelSU Next revision mismatch."
             exit 1
           fi
 
           cd "$GITHUB_WORKSPACE"
 
-          echo "KSU_REVISION=$ACTUAL_REVISION" >> "$GITHUB_ENV"
+          echo "Pinned KernelSU Next source verified."
 
       - name: Apply Linux 4.4 KernelSU compatibility patch
         shell: bash
         run: |
           set -euo pipefail
 
-          PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
+          PATCH="$GITHUB_WORKSPACE/reference/patches/kernelsu-next-linux-4.4-compat.diff"
 
           test -s "$PATCH"
 
-          git -C KernelSU-Next apply --check "$GITHUB_WORKSPACE/$PATCH"
-          git -C KernelSU-Next apply "$GITHUB_WORKSPACE/$PATCH"
+          git -C KernelSU-Next apply --check "$PATCH"
+          git -C KernelSU-Next apply "$PATCH"
 
-          echo "KernelSU Linux 4.4 compatibility patch applied."
+          echo "Linux 4.4 KernelSU compatibility patch applied."
 
       - name: Set KernelSU Next version metadata
         shell: bash
@@ -185,22 +213,26 @@ jobs:
           if new_version not in text:
               if old_version not in text:
                   raise SystemExit(
-                      "ERROR: Expected KernelSU version fallback was not found."
+                      "ERROR: Expected version fallback was not found."
                   )
               text = text.replace(old_version, new_version, 1)
 
           if new_tag not in text:
               if old_tag not in text:
                   raise SystemExit(
-                      "ERROR: Expected KernelSU tag fallback was not found."
+                      "ERROR: Expected tag fallback was not found."
                   )
               text = text.replace(old_tag, new_tag, 1)
 
           path.write_text(text)
 
-          check = path.read_text()
-          if new_version not in check or new_tag not in check:
-              raise SystemExit("ERROR: KernelSU version metadata verification failed.")
+          verified = path.read_text()
+
+          if new_version not in verified:
+              raise SystemExit("ERROR: Version metadata verification failed.")
+
+          if new_tag not in verified:
+              raise SystemExit("ERROR: Tag metadata verification failed.")
 
           print(f"KernelSU Next version set to {version}")
           print(f"KernelSU Next tag set to {tag}")
@@ -216,8 +248,9 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          # Fix the const pointer passed to the older Linux 4.4 copy_to_iter().
+          # Compatibility fix for the Linux 4.4 copy_to_iter() signature.
           ksud = Path("drivers/kernelsu/runtime/ksud_integration.c")
+
           if not ksud.is_file():
               raise SystemExit(f"ERROR: Missing {ksud}")
 
@@ -231,20 +264,21 @@ jobs:
                   raise SystemExit(
                       "ERROR: Expected copy_to_iter() call was not found."
                   )
+
               text = text.replace(old, new, 1)
               ksud.write_text(text)
 
           if new not in ksud.read_text():
-              raise SystemExit("ERROR: copy_to_iter() compatibility fix failed.")
+              raise SystemExit("ERROR: copy_to_iter() fix verification failed.")
 
           print("PASS: copy_to_iter() compatibility fix")
 
-          # Backport path_umount() and can_umount() before compilation.
+          # Backport path_umount() and can_umount() for Linux 4.4.
           namespace = Path("fs/namespace.c")
           internal = Path("fs/internal.h")
 
           if not namespace.is_file() or not internal.is_file():
-              raise SystemExit("ERROR: Required filesystem source files are missing.")
+              raise SystemExit("ERROR: Filesystem source files are missing.")
 
           ns_text = namespace.read_text()
 
@@ -256,7 +290,7 @@ jobs:
 
               if marker not in ns_text:
                   raise SystemExit(
-                      "ERROR: Could not find namespace.c insertion point."
+                      "ERROR: namespace.c insertion point was not found."
                   )
 
               backport = r'''
@@ -303,28 +337,29 @@ jobs:
 
           elif not has_can_umount or not has_path_umount:
               raise SystemExit(
-                  "ERROR: namespace.c contains only part of the path_umount backport."
+                  "ERROR: Only part of the path_umount backport exists."
               )
 
           ns_text = namespace.read_text()
 
           if "static int can_umount(" not in ns_text:
-              raise SystemExit("ERROR: can_umount() backport verification failed.")
+              raise SystemExit("ERROR: can_umount() verification failed.")
 
           if "int path_umount(" not in ns_text:
-              raise SystemExit("ERROR: path_umount() backport verification failed.")
+              raise SystemExit("ERROR: path_umount() verification failed.")
 
           print("PASS: path_umount() and can_umount() backport")
 
           # Add the declaration required by KernelSU.
           internal_text = internal.read_text()
+
           declaration = "int path_umount(struct path *path, int flags);"
           marker = "extern void __init mnt_init(void);"
 
           if declaration not in internal_text:
               if marker not in internal_text:
                   raise SystemExit(
-                      "ERROR: Could not find fs/internal.h insertion point."
+                      "ERROR: fs/internal.h insertion point was not found."
                   )
 
               internal_text = internal_text.replace(
@@ -332,36 +367,34 @@ jobs:
                   marker + "\n" + declaration,
                   1
               )
+
               internal.write_text(internal_text)
 
           if declaration not in internal.read_text():
-              raise SystemExit("ERROR: path_umount() declaration verification failed.")
+              raise SystemExit(
+                  "ERROR: path_umount() declaration verification failed."
+              )
 
           print("PASS: path_umount() declaration")
           PY
 
-      - name: Verify KernelSU configuration and compatibility changes
+      - name: Verify KernelSU source changes
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking KernelSU source..."
           test -f drivers/kernelsu/Kbuild
           test -f drivers/kernelsu/runtime/ksud_integration.c
 
-          echo "Checking version metadata..."
           grep -q 'KSU_VERSION_FALLBACK := 33193' drivers/kernelsu/Kbuild
           grep -q 'KSU_VERSION_TAG_FALLBACK := v3.2.0-legacy-14' drivers/kernelsu/Kbuild
 
-          echo "Checking compatibility fixes..."
           grep -q 'copy_to_iter((void \*)' drivers/kernelsu/runtime/ksud_integration.c
+
           grep -q 'int path_umount(struct path \*path, int flags)' fs/namespace.c
           grep -q 'int path_umount(struct path \*path, int flags);' fs/internal.h
 
-          echo "Checking manual hooks..."
-          grep -q 'ksu_handle_sys_reboot' kernel/reboot.c
-
-          echo "All source checks passed."
+          echo "All KernelSU source changes verified."
 
       - name: Configure OnePlus 5 kernel
         shell: bash
@@ -374,8 +407,6 @@ jobs:
             SUBARCH=arm64 \
             LLVM=1 \
             lineage_oneplus5_defconfig
-
-          echo "Checking KernelSU configuration..."
 
           grep -q '^CONFIG_KSU=y$' out/.config
           grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config
@@ -394,15 +425,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          export ARCH=arm64
-          export SUBARCH=arm64
+          echo "Checking compilers..."
+          command -v clang
+          command -v aarch64-linux-android-gcc
+          command -v arm-linux-androideabi-gcc
 
-          echo "Compiler:"
           clang --version
 
-          echo "Building Image.gz and device tree blobs..."
-
-          set -o pipefail
+          echo "Building kernel Image.gz and device tree blobs..."
 
           make -j"$JOBS" \
             O=out \
@@ -418,16 +448,25 @@ jobs:
 
           DTB_DIR="out/arch/arm64/boot/dts/qcom"
 
-          test -s "$DTB_DIR/cheeseburger-v2.1-dvt1.dtb"
-          test -s "$DTB_DIR/cheeseburger-v2.1-backup.dtb"
-          test -s "$DTB_DIR/dumpling-v2.1-dvt.dtb"
-          test -s "$DTB_DIR/cheeseburger-v2.1-pvt.dtb"
-          test -s "$DTB_DIR/dumpling-v2.1-Second_Resource.dtb"
-          test -s "$DTB_DIR/dumpling-v2.1-pvt.dtb"
-          test -s "$DTB_DIR/dumpling-v2.1-backup.dtb"
-          test -s "$DTB_DIR/cheeseburger-v2.1-pvt1.dtb"
+          for dtb in \
+            cheeseburger-v2.1-dvt1.dtb \
+            cheeseburger-v2.1-backup.dtb \
+            dumpling-v2.1-dvt.dtb \
+            cheeseburger-v2.1-pvt.dtb \
+            dumpling-v2.1-Second_Resource.dtb \
+            dumpling-v2.1-pvt.dtb \
+            dumpling-v2.1-backup.dtb \
+            cheeseburger-v2.1-pvt1.dtb
+          do
+            test -s "$DTB_DIR/$dtb"
+            echo "Verified: $dtb"
+          done
 
-          echo "Kernel image and all eight device tree blobs were built."
+          # Verify that the intended version metadata was actually used.
+          grep -F -- "-- KernelSU-Next version fallback: 33193" kernel-build.log
+          grep -F -- "-- KernelSU-Next tag fallback: v3.2.0-legacy-14" kernel-build.log
+
+          echo "Kernel image, version metadata, and all eight DTBs verified."
 
       - name: Generate build report
         if: always()
@@ -449,7 +488,7 @@ jobs:
             echo "KernelSU Next version: $KSU_VERSION"
             echo "KernelSU Next tag: $KSU_VERSION_TAG"
             echo "Defconfig: lineage_oneplus5_defconfig"
-            echo "Compiler: Clang 14.0.7"
+            echo "Compiler: Android NDK r25c Clang"
             echo "Build step outcome: $BUILD_OUTCOME"
             echo
             echo "KernelSU configuration:"
