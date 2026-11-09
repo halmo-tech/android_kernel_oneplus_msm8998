@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: Check out OnePlus 5 kernel
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: lineage-22.2
           fetch-depth: 1
@@ -46,19 +46,24 @@ jobs:
           grep -n kernelsu drivers/Makefile
           grep -n kernelsu drivers/Kconfig
 
-      - name: Locate manual integration points
+
+      - name: Inspect KernelSU integration locations
         run: |
+          echo "=== KernelSU configuration ==="
+          grep -nE 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES' \
+            arch/arm64/configs/lineage_oneplus5_defconfig || true
+
           echo "=== fs/exec.c ==="
-          grep -nE 'do_execve|do_execveat_common' fs/exec.c || true
+          sed -n '1665,1730p' fs/exec.c
 
           echo "=== fs/open.c ==="
-          grep -nE 'faccessat' fs/open.c || true
+          sed -n '335,375p' fs/open.c
 
           echo "=== fs/read_write.c ==="
-          grep -nE 'SYSCALL_DEFINE3\(read|vfs_read' fs/read_write.c || true
+          sed -n '425,470p' fs/read_write.c
 
           echo "=== fs/stat.c ==="
-          grep -nE 'newfstatat|vfs_fstatat' fs/stat.c || true
+          sed -n '280,315p' fs/stat.c
 
           echo "=== kernel/reboot.c ==="
-          grep -nE 'SYSCALL_DEFINE4\(reboot' kernel/reboot.c || true
+          sed -n '275,310p' kernel/reboot.c
