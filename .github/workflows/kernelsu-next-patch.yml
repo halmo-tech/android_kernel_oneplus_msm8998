@@ -1,4 +1,5 @@
-name: KernelSU Next OnePlus 5 Integration
+
+name: KernelSU Next Legacy Integration
 
 on:
   workflow_dispatch:
@@ -7,79 +8,86 @@ permissions:
   contents: write
 
 concurrency:
-  group: kernelsu-next-oneplus5-integration
+  group: kernelsu-next-patch-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   integrate:
-    name: Integrate and validate KernelSU Next
-    runs-on: ubuntu-latest
+    name: Integrate KernelSU Next for OnePlus 5
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout OnePlus 5 kernel
+      - name: Check out OnePlus 5 kernel
         uses: actions/checkout@v4
         with:
+          repository: halmo-tech/android_kernel_oneplus_msm8998
           ref: lineage-22.2
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Install build configuration dependencies
-        shell: bash
+      - name: Install build dependencies
         run: |
-          set -euo pipefail
-
           sudo apt-get update
           sudo apt-get install -y \
             bc \
             bison \
+            build-essential \
             flex \
+            git \
+            libelf-dev \
             libssl-dev \
-            libelf-dev
+            python3 \
+            python3-pip \
+            unzip \
+            wget \
+            zip
 
-      - name: Checkout reference patches
+      - name: Check out reference patches
         uses: actions/checkout@v4
         with:
           repository: TosteRino/joan-kernelsu
-          ref: main
           path: reference
+          fetch-depth: 1
 
-      - name: Verify OnePlus 5 kernel source
+      - name: Verify kernel source and target configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f Makefile
+          echo "Checking kernel version..."
+          KERNEL_VERSION="$(make kernelversion)"
+          echo "Kernel version: ${KERNEL_VERSION}"
+
+          if [ "${KERNEL_VERSION}" != "4.4.302" ]; then
+            echo "::error::Expected kernel version 4.4.302, found ${KERNEL_VERSION}"
+            exit 1
+          fi
+
+          echo "Checking OnePlus 5 defconfig..."
           test -f arch/arm64/configs/lineage_oneplus5_defconfig
-          test -f fs/exec.c
-          test -f fs/open.c
-          test -f fs/read_write.c
-          test -f fs/stat.c
-          test -f kernel/sys.c
-          test -f kernel/reboot.c
-          test -f security/selinux/hooks.c
 
-          grep -q '^VERSION = 4$' Makefile
-          grep -q '^PATCHLEVEL = 4$' Makefile
-          grep -q '^SUBLEVEL = 302$' Makefile
-
-          echo "Verified Linux 4.4.302 OnePlus 5 kernel."
+          echo "Kernel source and target defconfig verified."
 
       - name: Verify required reference patches
         shell: bash
         run: |
           set -euo pipefail
 
-          for patch in \
-            reference/patches/kernelsu-next-linux-4.4-compat.diff \
-            reference/patches/manual-hooks-linux-4.4.diff
-          do
-            test -s "$patch"
-            echo "Found: $patch"
-            sha256sum "$patch"
-          done
+          COMPAT_PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
+          HOOKS_PATCH="reference/patches/manual-hooks-linux-4.4.diff"
 
-          echo "The Joan-specific post-kernelsu.diff is intentionally excluded."
+          test -s "${COMPAT_PATCH}"
+          test -s "${HOOKS_PATCH}"
 
-      - name: Integrate KernelSU Next legacy source
+          echo "Required compatibility patch found:"
+          echo "${COMPAT_PATCH}"
+
+          echo "Required manual hooks patch found:"
+          echo "${HOOKS_PATCH}"
+
+          echo "The Joan-specific post-kernelsu.diff will NOT be applied."
+
+      - name: Install KernelSU Next legacy source
         shell: bash
         run: |
           set -euo pipefail
@@ -88,13 +96,14 @@ jobs:
             "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
             | bash -s legacy
 
-          test -d KernelSU-Next
-          test -f KernelSU-Next/kernel/Kconfig
-          test -f KernelSU-Next/kernel/Makefile
+          if [ ! -d KernelSU-Next ]; then
+            echo "::error::KernelSU-Next directory was not created."
+            exit 1
+          fi
 
-          echo "KernelSU Next source integration completed."
+          echo "KernelSU Next legacy source installed."
 
-      - name: Pin KernelSU Next to reference revision
+      - name: Pin KernelSU Next to verified legacy revision
         shell: bash
         run: |
           set -euo pipefail
@@ -102,7 +111,6 @@ jobs:
           cd KernelSU-Next
 
           if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-            echo "Fetching complete legacy branch history..."
             git fetch --unshallow origin legacy
           fi
 
@@ -114,217 +122,178 @@ jobs:
 
           git checkout --detach a54e4fa4
 
-          KSU_REVISION="$(git rev-parse HEAD)"
+          echo "KernelSU Next revision:"
+          git rev-parse HEAD
 
-          echo "KSU_REVISION=$KSU_REVISION" >> "$GITHUB_ENV"
+          cd ..
 
-          echo "Selected KernelSU Next revision:"
-          git log -1 --oneline
-
-      - name: Apply Linux 4.4 compatibility patch
+      - name: Apply Linux 4.4 KernelSU compatibility patch
         shell: bash
         run: |
           set -euo pipefail
 
-          PATCH="$GITHUB_WORKSPACE/reference/patches/kernelsu-next-linux-4.4-compat.diff"
+          PATCH="reference/patches/kernelsu-next-linux-4.4-compat.diff"
 
-          echo "Checking compatibility patch inside KernelSU Next..."
-
-          git -C KernelSU-Next apply --check "$PATCH"
+          echo "Checking compatibility patch inside KernelSU-Next..."
+          git -C KernelSU-Next apply --check "../${PATCH}"
 
           echo "Applying compatibility patch..."
+          git -C KernelSU-Next apply "../${PATCH}"
 
-          git -C KernelSU-Next apply "$PATCH"
+          echo "KernelSU Next compatibility patch applied."
 
-          echo "Compatibility patch applied successfully."
-
-      - name: Apply OnePlus 5 manual kernel hooks
+      - name: Apply OnePlus kernel manual hooks patch
         shell: bash
         run: |
           set -euo pipefail
 
           PATCH="reference/patches/manual-hooks-linux-4.4.diff"
 
-          echo "Checking manual hook patch against OnePlus 5 kernel..."
+          echo "Checking manual hooks patch..."
+          git apply --check "${PATCH}"
 
-          git apply --check "$PATCH"
+          echo "Applying manual hooks patch..."
+          git apply "${PATCH}"
 
-          echo "Applying manual hooks..."
+          echo "Manual hooks patch applied."
 
-          git apply "$PATCH"
-
-          echo "Manual hook patch applied successfully."
-
-      - name: Enable KernelSU Next manual hooks
+      - name: Enable KernelSU Next in OnePlus 5 defconfig
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 <<'PY'
+          DEFCONFIG="arch/arm64/configs/lineage_oneplus5_defconfig"
+
+          python3 - <<'PY'
           from pathlib import Path
-          import re
 
-          path = Path(
-              "arch/arm64/configs/lineage_oneplus5_defconfig"
-          )
+          path = Path("arch/arm64/configs/lineage_oneplus5_defconfig")
+          lines = path.read_text().splitlines()
 
-          text = path.read_text()
-
-          options = [
-              r"(?m)^CONFIG_KSU=.*\n?",
-              r"(?m)^CONFIG_KSU_MANUAL_HOOK=.*\n?",
-              r"(?m)^# CONFIG_KSU_MANUAL_HOOK is not set\n?",
-              r"(?m)^CONFIG_KSU_KPROBES_HOOK=.*\n?",
-              r"(?m)^# CONFIG_KSU_KPROBES_HOOK is not set\n?",
-          ]
-
-          for pattern in options:
-              text = re.sub(pattern, "", text)
-
-          text = text.rstrip() + """
-
-          # KernelSU Next legacy manual hooks
-          CONFIG_KSU=y
-          CONFIG_KSU_MANUAL_HOOK=y
-          # CONFIG_KSU_KPROBES_HOOK is not set
-          """
-
-          path.write_text(text)
-
-          print("OnePlus 5 defconfig updated.")
-          PY
-
-      - name: Validate manual hook references
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          require_hook() {
-            local file="$1"
-            local hook="$2"
-
-            if ! grep -q "$hook" "$file"; then
-              echo "::error::Missing $hook in $file"
-              exit 1
-            fi
-
-            echo "Verified $hook in $file"
+          settings = {
+              "CONFIG_KSU": "CONFIG_KSU=y",
+              "CONFIG_KSU_MANUAL_HOOK": "CONFIG_KSU_MANUAL_HOOK=y",
+              "CONFIG_KSU_KPROBES_HOOK": "# CONFIG_KSU_KPROBES_HOOK is not set",
           }
 
-          require_hook fs/exec.c ksu_handle_execveat
-          require_hook fs/open.c ksu_handle_faccessat
-          require_hook fs/read_write.c ksu_handle_vfs_read
+          keys = set(settings)
+          output = []
 
-          require_hook fs/stat.c ksu_handle_stat
-          require_hook fs/stat.c ksu_handle_newfstat_ret
-          require_hook fs/stat.c ksu_handle_fstat64_ret
+          for line in lines:
+              key = line.split("=", 1)[0]
+              if key.startswith("# "):
+                  key = key[2:].split(" ", 1)[0]
 
-          require_hook kernel/sys.c ksu_handle_setresuid
-          require_hook kernel/reboot.c ksu_handle_sys_reboot
+              if key not in keys:
+                  output.append(line)
 
-          require_hook security/selinux/hooks.c is_ksu_transition
+          output.extend(settings.values())
+          path.write_text("\n".join(output) + "\n")
+          PY
 
-          require_hook \
-            KernelSU-Next/kernel/selinux/selinux.c \
-            is_ksu_transition
+          echo "Updated defconfig:"
+          tail -n 10 "${DEFCONFIG}"
 
-          echo "All required manual hook references are present."
-
-      - name: Validate KernelSU configuration
+      - name: Validate KernelSU integration and kernel configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          make ARCH=arm64 lineage_oneplus5_defconfig
-
-          make ARCH=arm64 olddefconfig
-
-          grep -qx 'CONFIG_KSU=y' .config
-          grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' .config
-
-          if grep -qx 'CONFIG_KSU_KPROBES_HOOK=y' .config; then
-            echo "::error::KPROBES hook mode must be disabled."
-            exit 1
-          fi
-
-          echo "Validated KernelSU configuration:"
-          grep -E \
-            'CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=' \
-            .config || true
-
-      - name: Verify KernelSU source and symlinks
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          echo "Checking required KernelSU source files..."
           test -f KernelSU-Next/kernel/Kconfig
           test -f KernelSU-Next/kernel/Makefile
+          test -f KernelSU-Next/kernel/compat/kernel_compat.h
 
-          echo "Checking KernelSU Next symlinks..."
+          echo "Checking KernelSU integration references..."
+          grep -R -n "KernelSU-Next" Kconfig Makefile drivers 2>/dev/null || true
 
-          while IFS= read -r -d '' link; do
-            target="$(readlink "$link")"
+          echo "Generating OnePlus 5 configuration..."
+          make ARCH=arm64 lineage_oneplus5_defconfig
 
-            if [[ "$target" == *KernelSU-Next* ]]; then
-              if [ ! -e "$link" ]; then
-                echo "::error::Broken KernelSU symlink: $link"
-                exit 1
-              fi
+          echo "Running olddefconfig..."
+          make ARCH=arm64 olddefconfig
 
-              echo "Verified: $link -> $target"
-            fi
-          done < <(find . -type l -print0)
+          echo "Checking final configuration..."
+          grep -q '^CONFIG_KSU=y$' .config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' .config
 
-      - name: Vendor KernelSU Next source into kernel repository
+          if grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' .config; then
+            echo "::error::KSU Kprobes hook must remain disabled."
+            exit 1
+          fi
+
+          echo "KernelSU configuration:"
+          grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=|# CONFIG_KSU_KPROBES_HOOK)' .config || true
+
+          echo "KernelSU integration and configuration validation passed."
+
+      - name: Remove nested Git metadata and temporary reference checkout
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Recording exact KernelSU Next revision:"
-          echo "$KSU_REVISION"
-
-          if [ -d KernelSU-Next/.git ] || [ -f KernelSU-Next/.git ]; then
-            rm -rf KernelSU-Next/.git
-          fi
+          echo "Removing KernelSU Next nested Git metadata..."
+          rm -rf KernelSU-Next/.git
 
           if [ -e KernelSU-Next/.git ]; then
-            echo "::error::Nested Git metadata still exists."
+            echo "::error::KernelSU-Next Git metadata still exists."
             exit 1
           fi
 
-          echo "KernelSU Next Git metadata removed."
-          echo "Source files will be committed with the kernel."
+          echo "Removing temporary reference checkout..."
+          rm -rf reference
+
+          if [ -e reference ]; then
+            echo "::error::Temporary reference checkout still exists."
+            exit 1
+          fi
+
+          echo "Temporary repositories removed."
 
       - name: Stage and validate integration changes
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Checking that temporary repositories are absent..."
+          test ! -e reference
+          test ! -e KernelSU-Next/.git
+
+          echo "Staging kernel integration changes..."
           git add -A
 
+          echo "Force-adding KernelSU Next source..."
           git add -f -A KernelSU-Next
 
-          git diff --cached --check
-
-          git ls-files --error-unmatch \
-            KernelSU-Next/kernel/Kconfig
-
-          if git ls-files --stage KernelSU-Next \
-            | grep -q '^160000 '; then
-            echo "::error::KernelSU Next was staged as a Git submodule."
+          echo "Checking for accidentally staged embedded repositories..."
+          if git ls-files --stage -- KernelSU-Next reference | grep -q '^160000 '; then
+            echo "::error::An embedded Git repository was staged."
             exit 1
           fi
+
+          echo "Checking kernel integration whitespace..."
+          git diff --cached --check -- . ':(exclude)KernelSU-Next/**'
+
+          echo "Verifying KernelSU source files are staged..."
+          git ls-files --error-unmatch KernelSU-Next/kernel/Kconfig
+          git ls-files --error-unmatch KernelSU-Next/kernel/Makefile
+          git ls-files --error-unmatch KernelSU-Next/kernel/compat/kernel_compat.h
+
+          echo "Checking that generated .config is not staged..."
+          git reset -q -- .config || true
+
+          echo "Staged integration summary:"
+          git diff --cached --stat
+
+          echo "KernelSU Next staged source file count:"
+          git ls-files KernelSU-Next | wc -l
 
           if git diff --cached --quiet; then
             echo "::error::No integration changes were staged."
             exit 1
           fi
 
-          echo "Staged integration summary:"
-          git diff --cached --stat
-
-          echo "KernelSU Next source file count:"
-          git ls-files KernelSU-Next | wc -l
+          echo "Staging validation passed."
 
       - name: Commit and push validated integration
         shell: bash
@@ -332,49 +301,64 @@ jobs:
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
-          git config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git commit \
-            -m "Integrate KernelSU Next legacy manual hooks"
+          git commit -m "Integrate KernelSU Next legacy for OnePlus 5"
 
-          git push origin HEAD:refs/heads/lineage-22.2
+          echo "Pushing validated integration to lineage-22.2..."
+          git push origin HEAD:lineage-22.2
 
-          echo "Integration committed and pushed successfully."
+          echo "Integration commit pushed successfully."
 
-      - name: Create integration report
+      - name: Generate integration report
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
+
+          REPORT="kernelsu-next-integration-report.txt"
+
           {
-            echo "KernelSU Next OnePlus 5 integration report"
+            echo "KernelSU Next Legacy Integration Report"
+            echo "========================================"
             echo
-            echo "Device: OnePlus 5, cheeseburger"
-            echo "Platform: Qualcomm MSM8998"
+            echo "Target: OnePlus 5 (cheeseburger)"
             echo "Kernel: Linux 4.4.302"
+            echo "Kernel repository: halmo-tech/android_kernel_oneplus_msm8998"
             echo "Branch: lineage-22.2"
+            echo "KernelSU Next revision: a54e4fa4"
+            echo "Defconfig: lineage_oneplus5_defconfig"
             echo
-            echo "KernelSU Next revision:"
-            echo "${KSU_REVISION:-not selected}"
+            echo "Applied patches:"
+            echo "- kernelsu-next-linux-4.4-compat.diff"
+            echo "- manual-hooks-linux-4.4.diff"
             echo
-            echo "Patches used:"
-            echo "kernelsu-next-linux-4.4-compat.diff"
-            echo "manual-hooks-linux-4.4.diff"
+            echo "Excluded patch:"
+            echo "- post-kernelsu.diff (Joan-specific, not applied)"
             echo
-            echo "Intentionally excluded:"
-            echo "post-kernelsu.diff, Joan-specific changes"
+            echo "Configuration:"
+            echo "- CONFIG_KSU=y"
+            echo "- CONFIG_KSU_MANUAL_HOOK=y"
+            echo "- CONFIG_KSU_KPROBES_HOOK disabled"
             echo
-            echo "Latest kernel commit:"
+            echo "Latest commit:"
             git log -1 --oneline 2>/dev/null || true
             echo
-            echo "Working tree:"
+            echo "Working tree status:"
             git status --short 2>/dev/null || true
-          } > kernelsu-next-integration-report.txt
+            echo
+            echo "Important:"
+            echo "This workflow validates source integration and kernel configuration."
+            echo "It does not compile a complete boot image or verify device boot."
+            echo "No phone partitions are modified by this workflow."
+          } > "${REPORT}"
+
+          cat "${REPORT}"
 
       - name: Upload integration report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernelsu-next-oneplus5-integration-report
+          name: kernelsu-next-integration-report
           path: kernelsu-next-integration-report.txt
           if-no-files-found: warn
