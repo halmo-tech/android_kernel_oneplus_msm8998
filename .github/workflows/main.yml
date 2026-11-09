@@ -1,0 +1,64 @@
+
+name: OnePlus 5 KernelSU Next Source Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out OnePlus 5 kernel
+        uses: actions/checkout@v4
+        with:
+          ref: lineage-22.2
+          fetch-depth: 1
+
+      - name: Check kernel version and device configuration
+        run: |
+          echo "=== Kernel version ==="
+          head -n 4 Makefile
+
+          echo "=== OnePlus 5 defconfig ==="
+          if [ -f arch/arm64/configs/lineage_oneplus5_defconfig ]; then
+            grep -nE 'CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULES' \
+              arch/arm64/configs/lineage_oneplus5_defconfig || true
+          else
+            echo "ERROR: Expected defconfig not found"
+            exit 1
+          fi
+
+      - name: Integrate KernelSU Next legacy source
+        run: |
+          curl -LSs \
+            https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh \
+            | bash -s legacy
+
+          echo "=== KernelSU Next version ==="
+          git -C KernelSU-Next describe --tags --always
+
+          echo "=== KernelSU source integration ==="
+          ls -ld drivers/kernelsu
+          grep -n kernelsu drivers/Makefile
+          grep -n kernelsu drivers/Kconfig
+
+      - name: Locate manual integration points
+        run: |
+          echo "=== fs/exec.c ==="
+          grep -nE 'do_execve|do_execveat_common' fs/exec.c || true
+
+          echo "=== fs/open.c ==="
+          grep -nE 'faccessat' fs/open.c || true
+
+          echo "=== fs/read_write.c ==="
+          grep -nE 'SYSCALL_DEFINE3\(read|vfs_read' fs/read_write.c || true
+
+          echo "=== fs/stat.c ==="
+          grep -nE 'newfstatat|vfs_fstatat' fs/stat.c || true
+
+          echo "=== kernel/reboot.c ==="
+          grep -nE 'SYSCALL_DEFINE4\(reboot' kernel/reboot.c || true
