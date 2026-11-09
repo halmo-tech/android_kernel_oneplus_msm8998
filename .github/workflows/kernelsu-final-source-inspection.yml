@@ -18,6 +18,24 @@ jobs:
           ref: lineage-22.2
           fetch-depth: 1
 
+      - name: Integrate KernelSU Next legacy source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+
+          echo
+          echo "===== KernelSU source directory ====="
+          if [ -d KernelSU-Next ]; then
+            echo "KernelSU-Next directory found"
+            find KernelSU-Next -maxdepth 2 -type f | head -40
+          else
+            echo "ERROR: KernelSU-Next directory was not created"
+            echo "Checking likely integration locations:"
+            find . -maxdepth 4 -iname '*kernelsu*' -print
+            exit 1
+          fi
+
       - name: Inspect exact source locations
         shell: bash
         run: |
@@ -43,12 +61,20 @@ jobs:
 
           show("kernel/sys.c", 580, 650)
           show("fs/exec.c", 1530, 1620)
-          show("fs/open.c", 340, 365)
+          show("fs/exec.c", 1620, 1680)
+          show("fs/open.c", 340, 390)
           show("fs/read_write.c", 435, 465)
           show("fs/stat.c", 270, 315)
           show("fs/stat.c", 400, 445)
-          show("kernel/reboot.c", 275, 320)
+          show("kernel/reboot.c", 275, 325)
           show("security/selinux/hooks.c", 2260, 2305)
+
+          show("KernelSU-Next/kernel/core/init.c", 20, 55)
+          show("KernelSU-Next/kernel/runtime/ksud_integration.c", 270, 310)
+          show("KernelSU-Next/kernel/runtime/ksud_integration.c", 935, 1050)
+          show("KernelSU-Next/kernel/selinux/selinux.c", 1, 100)
+          show("KernelSU-Next/kernel/selinux/selinux.h", 1, 140)
+          show("KernelSU-Next/kernel/hook/setuid_hook.c", 1, 100)
           PY
 
       - name: Search KernelSU hook declarations and references
@@ -114,11 +140,7 @@ jobs:
         shell: bash
         run: |
           echo "===== OnePlus 5 defconfig ====="
-          if [ -f arch/arm64/configs/lineage_oneplus5_defconfig ]; then
-            nl -ba arch/arm64/configs/lineage_oneplus5_defconfig
-          else
-            echo "ERROR: OnePlus 5 defconfig not found"
-          fi
+          nl -ba arch/arm64/configs/lineage_oneplus5_defconfig
 
           echo
           echo "===== KernelSU Kconfig ====="
@@ -131,13 +153,7 @@ jobs:
 
           echo
           echo "===== KernelSU integration status ====="
-
-          if [ -d KernelSU-Next ]; then
-            echo "KernelSU-Next directory exists"
-            git -C KernelSU-Next status --short 2>/dev/null || true
-          else
-            echo "KernelSU-Next directory does not exist"
-          fi
+          git status --short
 
       - name: Upload inspection report
         if: always()
