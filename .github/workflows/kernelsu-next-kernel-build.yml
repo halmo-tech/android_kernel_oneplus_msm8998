@@ -1,0 +1,314 @@
+name: OnePlus 5 KernelSU Next Kernel Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oneplus5-kernelsu-next-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Compile OnePlus 5 KernelSU Next kernel
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out integrated OnePlus 5 kernel
+        uses: actions/checkout@v5
+        with:
+          ref: lineage-22.2
+          fetch-depth: 0
+
+      - name: Verify integration commit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EXPECTED_COMMIT="8e7088d77725"
+
+          echo "Current branch:"
+          git branch --show-current
+
+          echo "Current commit:"
+          git log -1 --oneline
+
+          if ! git merge-base --is-ancestor \
+            "${EXPECTED_COMMIT}" HEAD; then
+            echo "::error::The expected KernelSU integration commit is not present in this branch."
+            exit 1
+          fi
+
+          echo "Verified KernelSU integration commit."
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            device-tree-compiler \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lz4 \
+            python3 \
+            rsync \
+            unzip \
+            wget \
+            zip
+
+      - name: Download Android NDK r25c
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+          NDK_ZIP="${RUNNER_TEMP}/android-ndk-r25c-linux.zip"
+
+          echo "Downloading Android NDK r25c..."
+          curl -fL --retry 3 "${NDK_URL}" -o "${NDK_ZIP}"
+
+          echo "Extracting Android NDK..."
+          unzip -q "${NDK_ZIP}" -d "${RUNNER_TEMP}"
+
+          NDK_BIN="${RUNNER_TEMP}/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          test -x "${NDK_BIN}/clang"
+
+          echo "ANDROID_NDK_HOME=${RUNNER_TEMP}/android-ndk-r25c" >> "${GITHUB_ENV}"
+          echo "${NDK_BIN}" >> "${GITHUB_PATH}"
+
+          echo "NDK Clang version:"
+          "${NDK_BIN}/clang" --version
+
+      - name: Download AArch64 GCC 4.9 cross compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p toolchains
+
+          git clone \
+            --depth=1 \
+            --branch lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            toolchains/aarch64
+
+          test -x toolchains/aarch64/bin/aarch64-linux-android-gcc
+
+          echo "${GITHUB_WORKSPACE}/toolchains/aarch64/bin" >> "${GITHUB_PATH}"
+
+          echo "AArch64 GCC version:"
+          toolchains/aarch64/bin/aarch64-linux-android-gcc --version
+
+      - name: Download ARM32 GCC 4.9 cross compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p toolchains
+
+          git clone \
+            --depth=1 \
+            --branch lineage-19.1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            toolchains/arm
+
+          test -x toolchains/arm/bin/arm-linux-androideabi-gcc
+
+          echo "${GITHUB_WORKSPACE}/toolchains/arm/bin" >> "${GITHUB_PATH}"
+
+          echo "ARM32 GCC version:"
+          toolchains/arm/bin/arm-linux-androideabi-gcc --version
+
+      - name: Verify build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Clang:"
+          clang --version
+
+          echo
+          echo "AArch64 cross compiler:"
+          aarch64-linux-android-gcc --version
+
+          echo
+          echo "ARM32 cross compiler:"
+          arm-linux-androideabi-gcc --version
+
+          echo
+          echo "Kernel version:"
+          make kernelversion
+
+          if [ "$(make kernelversion)" != "4.4.302" ]; then
+            echo "::error::Unexpected kernel version."
+            exit 1
+          fi
+
+          echo "Build environment verified."
+
+      - name: Generate OnePlus 5 kernel configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          make \
+            -j2 \
+            O=out \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            LLVM=1 \
+            lineage_oneplus5_defconfig
+
+          echo "Checking KernelSU configuration..."
+
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config
+
+          if grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' out/.config; then
+            echo "::error::Kprobes hook must remain disabled."
+            exit 1
+          fi
+
+          echo
+          echo "KernelSU configuration:"
+          grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=|# CONFIG_KSU_KPROBES_HOOK)' out/.config || true
+
+          echo
+          echo "Configuration generated successfully."
+
+      - name: Compile kernel and device tree blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          JOBS="$(nproc --all)"
+
+          echo "Using ${JOBS} parallel build jobs."
+
+          echo "Starting OnePlus 5 kernel compilation..."
+
+          make \
+            -j"${JOBS}" \
+            O=out \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LLVM=1 \
+            Image.gz dtbs \
+            2>&1 | tee "${GITHUB_WORKSPACE}/kernel-build.log"
+
+          echo "Kernel compilation completed."
+
+      - name: Verify compiled kernel outputs
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE="out/arch/arm64/boot/Image.gz"
+
+          if [ ! -s "${IMAGE}" ]; then
+            echo "::error::Image.gz was not generated."
+            exit 1
+          fi
+
+          echo "Compiled kernel image:"
+          ls -lh "${IMAGE}"
+
+          echo
+          echo "Checking device tree output..."
+
+          DTB_COUNT="$(find out/arch/arm64/boot/dts -type f -name '*.dtb' | wc -l)"
+
+          echo "DTB files generated: ${DTB_COUNT}"
+
+          if [ "${DTB_COUNT}" -eq 0 ]; then
+            echo "::error::No device tree blobs were generated."
+            exit 1
+          fi
+
+          echo
+          echo "Kernel image and device tree validation passed."
+
+      - name: Generate build report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT="oneplus5-kernelsu-next-build-report.txt"
+
+          {
+            echo "OnePlus 5 KernelSU Next Build Report"
+            echo "===================================="
+            echo
+            echo "Device: OnePlus 5 (cheeseburger)"
+            echo "Architecture: ARM64"
+            echo "Kernel version: $(make kernelversion 2>/dev/null || echo unknown)"
+            echo "Branch: lineage-22.2"
+            echo "Integration commit: 8e7088d77725"
+            echo "KernelSU Next revision: a54e4fa4"
+            echo "Defconfig: lineage_oneplus5_defconfig"
+            echo
+            echo "Compiler:"
+            clang --version 2>/dev/null | head -n 1 || true
+            echo
+            echo "Kernel configuration:"
+            if [ -f out/.config ]; then
+              grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=|# CONFIG_KSU_KPROBES_HOOK)' out/.config || true
+            else
+              echo "Configuration not generated."
+            fi
+            echo
+            echo "Kernel image:"
+            if [ -s out/arch/arm64/boot/Image.gz ]; then
+              ls -lh out/arch/arm64/boot/Image.gz
+              sha256sum out/arch/arm64/boot/Image.gz
+            else
+              echo "Image.gz not generated."
+            fi
+            echo
+            echo "Device tree blobs:"
+            find out/arch/arm64/boot/dts -type f -name '*.dtb' 2>/dev/null | sort || true
+            echo
+            echo "Git commit:"
+            git log -1 --oneline
+            echo
+            echo "This workflow does not create or flash a boot image."
+          } > "${REPORT}"
+
+          cat "${REPORT}"
+
+      - name: Upload kernel build artifacts and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus5-kernelsu-next-kernel-build
+          path: |
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/dts/**/*.dtb
+            out/vmlinux
+            out/System.map
+            out/.config
+            kernel-build.log
+            oneplus5-kernelsu-next-build-report.txt
+          if-no-files-found: warn
+          retention-days: 14
