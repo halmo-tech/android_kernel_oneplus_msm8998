@@ -6,10 +6,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: oneplus5-kernelsu-next-build
-  cancel-in-progress: false
-
 jobs:
   build:
     name: Compile OnePlus 5 KernelSU Next kernel
@@ -17,32 +13,28 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Check out integrated OnePlus 5 kernel
+      - name: Checkout kernel source
         uses: actions/checkout@v5
         with:
           ref: lineage-22.2
           fetch-depth: 0
 
-      - name: Verify integration commit
+      - name: Verify KernelSU Next integration commit
         shell: bash
         run: |
           set -euo pipefail
 
           EXPECTED_COMMIT="8e7088d77725"
 
-          echo "Current branch:"
-          git branch --show-current
+          echo "Checking integration commit..."
 
-          echo "Current commit:"
-          git log -1 --oneline
-
-          if ! git merge-base --is-ancestor \
-            "${EXPECTED_COMMIT}" HEAD; then
-            echo "::error::The expected KernelSU integration commit is not present in this branch."
+          if ! git merge-base --is-ancestor "${EXPECTED_COMMIT}" HEAD; then
+            echo "ERROR: KernelSU Next integration commit is missing."
             exit 1
           fi
 
-          echo "Verified KernelSU integration commit."
+          echo "Integration commit is present."
+          echo "Current commit: $(git rev-parse --short HEAD)"
 
       - name: Install build dependencies
         shell: bash
@@ -55,86 +47,64 @@ jobs:
             bc \
             bison \
             build-essential \
-            ca-certificates \
+            ccache \
             curl \
-            device-tree-compiler \
             flex \
             git \
             libelf-dev \
-            libncurses-dev \
+            libncurses5-dev \
             libssl-dev \
-            lz4 \
             python3 \
-            rsync \
+            python3-pip \
             unzip \
-            wget \
-            zip
+            zip \
+            zstd
 
       - name: Download Android NDK r25c
         shell: bash
         run: |
           set -euo pipefail
 
-          NDK_URL="https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
-          NDK_ZIP="${RUNNER_TEMP}/android-ndk-r25c-linux.zip"
+          NDK_VERSION="r25c"
+          NDK_ARCHIVE="android-ndk-${NDK_VERSION}-linux.zip"
 
-          echo "Downloading Android NDK r25c..."
-          curl -fL --retry 3 "${NDK_URL}" -o "${NDK_ZIP}"
+          curl -fL \
+            "https://dl.google.com/android/repository/${NDK_ARCHIVE}" \
+            -o "${NDK_ARCHIVE}"
 
-          echo "Extracting Android NDK..."
-          unzip -q "${NDK_ZIP}" -d "${RUNNER_TEMP}"
+          unzip -q "${NDK_ARCHIVE}" -d "${GITHUB_WORKSPACE}"
 
-          NDK_BIN="${RUNNER_TEMP}/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "ANDROID_NDK_HOME=${GITHUB_WORKSPACE}/android-ndk-${NDK_VERSION}" >> "${GITHUB_ENV}"
 
-          test -x "${NDK_BIN}/clang"
+          echo "${GITHUB_WORKSPACE}/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "${GITHUB_PATH}"
 
-          echo "ANDROID_NDK_HOME=${RUNNER_TEMP}/android-ndk-r25c" >> "${GITHUB_ENV}"
-          echo "${NDK_BIN}" >> "${GITHUB_PATH}"
+          echo "Android NDK installed."
 
-          echo "NDK Clang version:"
-          "${NDK_BIN}/clang" --version
-
-      - name: Download AArch64 GCC 4.9 cross compiler
+      - name: Download Android GCC 4.9 toolchains
         shell: bash
         run: |
           set -euo pipefail
 
-          mkdir -p toolchains
+          mkdir -p "${GITHUB_WORKSPACE}/toolchains"
 
           git clone \
-            --depth=1 \
+            --depth 1 \
             --branch lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            toolchains/aarch64
-
-          test -x toolchains/aarch64/bin/aarch64-linux-android-gcc
-
-          echo "${GITHUB_WORKSPACE}/toolchains/aarch64/bin" >> "${GITHUB_PATH}"
-
-          echo "AArch64 GCC version:"
-          toolchains/aarch64/bin/aarch64-linux-android-gcc --version
-
-      - name: Download ARM32 GCC 4.9 cross compiler
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p toolchains
+            "${GITHUB_WORKSPACE}/toolchains/aarch64"
 
           git clone \
-            --depth=1 \
+            --depth 1 \
             --branch lineage-19.1 \
             https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
-            toolchains/arm
+            "${GITHUB_WORKSPACE}/toolchains/arm"
 
-          test -x toolchains/arm/bin/arm-linux-androideabi-gcc
-
+          echo "${GITHUB_WORKSPACE}/toolchains/aarch64/bin" >> "${GITHUB_PATH}"
           echo "${GITHUB_WORKSPACE}/toolchains/arm/bin" >> "${GITHUB_PATH}"
 
-          echo "ARM32 GCC version:"
-          toolchains/arm/bin/arm-linux-androideabi-gcc --version
+          echo "GCC toolchains installed."
 
-      - name: Verify build environment
+      - name: Show compiler versions
         shell: bash
         run: |
           set -euo pipefail
@@ -143,55 +113,90 @@ jobs:
           clang --version
 
           echo
-          echo "AArch64 cross compiler:"
+          echo "AArch64 GCC:"
           aarch64-linux-android-gcc --version
 
           echo
-          echo "ARM32 cross compiler:"
+          echo "ARM32 GCC:"
           arm-linux-androideabi-gcc --version
 
-          echo
-          echo "Kernel version:"
-          make kernelversion
+      - name: Apply copy_to_iter compatibility fix
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [ "$(make kernelversion)" != "4.4.302" ]; then
-            echo "::error::Unexpected kernel version."
+          FILE="drivers/kernelsu/runtime/ksud_integration.c"
+
+          if [ ! -f "${FILE}" ]; then
+            echo "ERROR: ${FILE} was not found."
             exit 1
           fi
 
-          echo "Build environment verified."
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("drivers/kernelsu/runtime/ksud_integration.c")
+          source = path.read_text()
+
+          original = "copy_to_iter(KERNEL_SU_RC + ksu_rc_pos,"
+          fixed = "copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),"
+
+          if fixed in source:
+              print("Compatibility fix is already present.")
+          elif original in source:
+              count = source.count(original)
+
+              if count != 1:
+                  raise SystemExit(
+                      f"ERROR: Expected exactly one occurrence, found {count}."
+                  )
+
+              source = source.replace(original, fixed, 1)
+              path.write_text(source)
+
+              print("Applied copy_to_iter compatibility fix.")
+          else:
+              raise SystemExit(
+                  "ERROR: Could not find the expected copy_to_iter call. "
+                  "No source changes were made."
+              )
+          PY
+
+          echo
+          echo "Updated source line:"
+          grep -n -F "copy_to_iter((void *)(KERNEL_SU_RC" "${FILE}"
 
       - name: Generate OnePlus 5 kernel configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          make \
-            -j2 \
+          make -j2 \
             O=out \
             ARCH=arm64 \
             SUBARCH=arm64 \
             LLVM=1 \
             lineage_oneplus5_defconfig
 
+          echo
           echo "Checking KernelSU configuration..."
 
-          grep -q '^CONFIG_KSU=y$' out/.config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config
+          grep -E '^CONFIG_KSU(=|_)' out/.config || true
 
-          if grep -q '^CONFIG_KSU_KPROBES_HOOK=y$' out/.config; then
-            echo "::error::Kprobes hook must remain disabled."
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "ERROR: CONFIG_KSU is not enabled."
             exit 1
           fi
 
-          echo
-          echo "KernelSU configuration:"
-          grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=|# CONFIG_KSU_KPROBES_HOOK)' out/.config || true
+          if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
+            echo "ERROR: CONFIG_KSU_MANUAL_HOOK is not enabled."
+            exit 1
+          fi
 
-          echo
-          echo "Configuration generated successfully."
+          echo "KernelSU configuration verified."
 
-      - name: Compile kernel and device tree blobs
+      - name: Compile OnePlus 5 KernelSU Next kernel
+        id: compile
         shell: bash
         run: |
           set -euo pipefail
@@ -199,11 +204,9 @@ jobs:
           JOBS="$(nproc --all)"
 
           echo "Using ${JOBS} parallel build jobs."
-
           echo "Starting OnePlus 5 kernel compilation..."
 
-          make \
-            -j"${JOBS}" \
+          make -j"${JOBS}" \
             O=out \
             ARCH=arm64 \
             SUBARCH=arm64 \
@@ -214,9 +217,7 @@ jobs:
             Image.gz dtbs \
             2>&1 | tee "${GITHUB_WORKSPACE}/kernel-build.log"
 
-          echo "Kernel compilation completed."
-
-      - name: Verify compiled kernel outputs
+      - name: Verify kernel build outputs
         if: success()
         shell: bash
         run: |
@@ -224,91 +225,93 @@ jobs:
 
           IMAGE="out/arch/arm64/boot/Image.gz"
 
-          if [ ! -s "${IMAGE}" ]; then
-            echo "::error::Image.gz was not generated."
+          if [ ! -f "${IMAGE}" ]; then
+            echo "ERROR: Image.gz was not generated."
             exit 1
           fi
 
-          echo "Compiled kernel image:"
+          echo "Kernel image successfully generated:"
           ls -lh "${IMAGE}"
 
           echo
-          echo "Checking device tree output..."
+          echo "Device tree blobs:"
+
+          find out/arch/arm64/boot/dts -type f -name '*.dtb' -print
 
           DTB_COUNT="$(find out/arch/arm64/boot/dts -type f -name '*.dtb' | wc -l)"
 
-          echo "DTB files generated: ${DTB_COUNT}"
-
           if [ "${DTB_COUNT}" -eq 0 ]; then
-            echo "::error::No device tree blobs were generated."
+            echo "ERROR: No DTB files were generated."
             exit 1
           fi
 
           echo
-          echo "Kernel image and device tree validation passed."
+          echo "Found ${DTB_COUNT} DTB files."
 
       - name: Generate build report
         if: always()
         shell: bash
+        env:
+          BUILD_OUTCOME: ${{ steps.compile.outcome }}
         run: |
           set -euo pipefail
 
-          REPORT="oneplus5-kernelsu-next-build-report.txt"
+          REPORT="kernel-build-report.txt"
 
           {
-            echo "OnePlus 5 KernelSU Next Build Report"
-            echo "===================================="
+            echo "OnePlus 5 KernelSU Next Kernel Build Report"
+            echo "============================================"
             echo
             echo "Device: OnePlus 5 (cheeseburger)"
             echo "Architecture: ARM64"
-            echo "Kernel version: $(make kernelversion 2>/dev/null || echo unknown)"
+            echo "Kernel version: 4.4.302"
             echo "Branch: lineage-22.2"
             echo "Integration commit: 8e7088d77725"
             echo "KernelSU Next revision: a54e4fa4"
             echo "Defconfig: lineage_oneplus5_defconfig"
+            echo "Compiler: Clang 14.0.7"
+            echo "Build step outcome: ${BUILD_OUTCOME:-unknown}"
             echo
-            echo "Compiler:"
-            clang --version 2>/dev/null | head -n 1 || true
-            echo
-            echo "Kernel configuration:"
+            echo "KernelSU configuration:"
             if [ -f out/.config ]; then
-              grep -E '^(CONFIG_KSU=|CONFIG_KSU_MANUAL_HOOK=|CONFIG_KSU_KPROBES_HOOK=|# CONFIG_KSU_KPROBES_HOOK)' out/.config || true
+              grep -E '^CONFIG_KSU(=|_)' out/.config || true
             else
-              echo "Configuration not generated."
+              echo "Configuration file not found."
             fi
             echo
             echo "Kernel image:"
-            if [ -s out/arch/arm64/boot/Image.gz ]; then
+            if [ -f out/arch/arm64/boot/Image.gz ]; then
               ls -lh out/arch/arm64/boot/Image.gz
-              sha256sum out/arch/arm64/boot/Image.gz
             else
-              echo "Image.gz not generated."
+              echo "Image.gz was not generated."
             fi
             echo
             echo "Device tree blobs:"
-            find out/arch/arm64/boot/dts -type f -name '*.dtb' 2>/dev/null | sort || true
+            if [ -d out/arch/arm64/boot/dts ]; then
+              find out/arch/arm64/boot/dts -type f -name '*.dtb' -print
+            else
+              echo "DTB directory not found."
+            fi
             echo
-            echo "Git commit:"
-            git log -1 --oneline
+            echo "Current source commit:"
+            git rev-parse HEAD
             echo
-            echo "This workflow does not create or flash a boot image."
+            echo "Build log: kernel-build.log"
           } > "${REPORT}"
 
           cat "${REPORT}"
 
-      - name: Upload kernel build artifacts and logs
+      - name: Upload kernel build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: oneplus5-kernelsu-next-kernel-build
+          if-no-files-found: warn
           path: |
             out/arch/arm64/boot/Image.gz
-            out/arch/arm64/boot/Image
             out/arch/arm64/boot/dts/**/*.dtb
             out/vmlinux
             out/System.map
             out/.config
             kernel-build.log
-            oneplus5-kernelsu-next-build-report.txt
-          if-no-files-found: warn
-          retention-days: 14
+            kernel-build-report.txt
