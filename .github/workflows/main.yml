@@ -1,5 +1,5 @@
 
-name: OnePlus 5 KernelSU Next Source Audit
+name: OnePlus 5 KernelSU Next Integration Audit
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   audit:
-    name: Inspect OnePlus 5 kernel integration points
+    name: Verify KernelSU Next hook implementations
     runs-on: ubuntu-22.04
 
     steps:
@@ -25,7 +25,7 @@ jobs:
           set -euo pipefail
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
-      - name: Inspect kernel source and KernelSU interfaces
+      - name: Inspect exact kernel hook locations and implementations
         shell: bash
         run: |
           set -euo pipefail
@@ -34,209 +34,190 @@ jobs:
           from pathlib import Path
           import re
 
-          output = []
+          report = []
 
-          def report(title, content):
-              output.append("")
-              output.append("=" * 75)
-              output.append(title)
-              output.append("=" * 75)
-              output.append(content)
+          def section(title, content):
+              report.append("")
+              report.append("=" * 78)
+              report.append(title)
+              report.append("=" * 78)
+              report.append(content)
 
-          def inspect_file(filename, patterns, radius=18):
+          def inspect_kernel_file(filename, patterns, radius=16):
               path = Path(filename)
 
               if not path.exists():
-                  report(filename, "FILE NOT FOUND")
+                  section(filename, "FILE NOT FOUND")
                   return
 
               lines = path.read_text(errors="replace").splitlines()
-              sections = []
-              found_ranges = []
+              ranges = []
+              blocks = []
 
               for number, line in enumerate(lines):
-                  for pattern in patterns:
-                      if re.search(pattern, line):
-                          start = max(0, number - radius)
-                          end = min(len(lines), number + radius + 1)
+                  if any(re.search(p, line) for p in patterns):
+                      start = max(0, number - radius)
+                      end = min(len(lines), number + radius + 1)
 
-                          if not any(
-                              start < old_end and end > old_start
-                              for old_start, old_end in found_ranges
-                          ):
-                              found_ranges.append((start, end))
-                              sections.append(
-                                  "\n--- Lines {} to {} ---\n{}".format(
-                                      start + 1,
-                                      end,
-                                      "\n".join(
-                                          f"{i + 1}: {lines[i]}"
-                                          for i in range(start, end)
-                                      )
-                                  )
+                      if any(
+                          start < old_end and end > old_start
+                          for old_start, old_end in ranges
+                      ):
+                          continue
+
+                      ranges.append((start, end))
+                      blocks.append(
+                          "\n--- Lines {} to {} ---\n{}".format(
+                              start + 1,
+                              end,
+                              "\n".join(
+                                  f"{i + 1}: {lines[i]}"
+                                  for i in range(start, end)
                               )
+                          )
+                      )
 
-              report(
+              section(
                   filename,
-                  "\n".join(sections)
-                  if sections
-                  else "No matching functions found."
+                  "\n".join(blocks)
+                  if blocks else "No matching locations found."
               )
 
-          report(
-              "DEVICE AND BRANCH",
-              "Repository: halmo-tech/android_kernel_oneplus_msm8998\n"
-              "Branch: lineage-22.2\n"
-              "Target: OnePlus 5 (cheeseburger)\n"
-              "Kernel family: Linux 4.4"
+          section(
+              "DEVICE",
+              "OnePlus 5 (cheeseburger)\n"
+              "Kernel source branch: lineage-22.2\n"
+              "Kernel version: Linux 4.4.302"
           )
 
-          inspect_file(
+          inspect_kernel_file(
               "fs/exec.c",
               [
+                  r"SYSCALL_DEFINE3\s*\(\s*execve",
+                  r"COMPAT_SYSCALL_DEFINE3\s*\(\s*execve",
                   r"do_execve\s*\(",
-                  r"compat_do_execve\s*\(",
-                  r"do_execveat_common\s*\("
+                  r"compat_do_execve\s*\("
               ],
+              22
+          )
+
+          inspect_kernel_file(
+              "fs/open.c",
+              [r"SYSCALL_DEFINE3\s*\(\s*faccessat"],
               24
           )
 
-          inspect_file(
-              "fs/open.c",
-              [
-                  r"SYSCALL_DEFINE3\s*\(\s*faccessat"
-              ],
-              28
-          )
-
-          inspect_file(
+          inspect_kernel_file(
               "fs/read_write.c",
-              [
-                  r"vfs_read\s*\(",
-                  r"SYSCALL_DEFINE3\s*\(\s*read"
-              ],
-              28
+              [r"vfs_read\s*\("],
+              24
           )
 
-          inspect_file(
+          inspect_kernel_file(
               "fs/stat.c",
-              [
-                  r"SYSCALL_DEFINE4\s*\(\s*newfstatat"
-              ],
-              28
+              [r"SYSCALL_DEFINE4\s*\(\s*newfstatat"],
+              20
           )
 
-          inspect_file(
+          inspect_kernel_file(
               "kernel/reboot.c",
-              [
-                  r"SYSCALL_DEFINE4\s*\(\s*reboot"
-              ],
-              28
+              [r"SYSCALL_DEFINE4\s*\(\s*reboot"],
+              22
           )
 
-          inspect_file(
+          inspect_kernel_file(
               "arch/arm64/configs/lineage_oneplus5_defconfig",
               [
                   r"CONFIG_KSU",
                   r"CONFIG_KPROBES",
                   r"CONFIG_MODULES"
               ],
-              5
+              6
           )
 
-          ksu_paths = [
-              "KernelSU",
-              "drivers/kernelsu",
-              "KernelSU/kernel",
-              "drivers/kernelsu/kernel"
-          ]
+          ksu_root = Path("KernelSU-Next/kernel")
 
-          for name in ksu_paths:
-              path = Path(name)
+          if not ksu_root.exists():
+              ksu_root = Path("drivers/kernelsu")
 
-              if path.exists():
-                  config_files = list(path.rglob("Kconfig"))[:10]
+          section("KERNELSU SOURCE ROOT", str(ksu_root))
 
-                  report(
-                      "KernelSU source location",
-                      f"Found: {name}\n"
-                      + (
-                          "\n".join(str(p) for p in config_files)
-                          if config_files
-                          else "No Kconfig files found in this location."
-                      )
-                  )
-
-          config_found = False
-
-          for path in Path(".").rglob("Kconfig"):
-              if "KernelSU" in str(path) or "kernelsu" in str(path).lower():
-                  text = path.read_text(errors="replace")
-
-                  if "config KSU" in text:
-                      config_found = True
-                      report(
-                          f"KernelSU Kconfig: {path}",
-                          text[:16000]
-                      )
-
-          if not config_found:
-              report(
-                  "KernelSU Kconfig search",
-                  "No Kconfig containing config KSU was found."
-              )
-
-          handler_names = [
-              "ksu_handle_execveat",
-              "ksu_handle_faccessat",
-              "ksu_handle_sys_read",
+          symbols = [
+              "ksu_handle_sys_reboot",
+              "ksu_handle_execve_ksud",
+              "ksu_handle_compat_execve_ksud",
+              "ksu_handle_execveat_ksud",
               "ksu_handle_vfs_read",
-              "ksu_handle_stat",
-              "ksu_handle_sys_reboot"
+              "ksu_handle_sys_read",
+              "ksu_handle_faccessat",
+              "ksu_handle_stat"
           ]
 
-          declaration_count = 0
+          source_extensions = {
+              ".c", ".h", ".mk"
+          }
 
-          for path in Path(".").rglob("*.h"):
-              if ".git" in path.parts:
-                  continue
+          matches_found = 0
 
-              text = path.read_text(errors="replace")
-              matches = [
-                  name for name in handler_names
-                  if name in text
-              ]
+          if ksu_root.exists():
+              for path in ksu_root.rglob("*"):
+                  if not path.is_file():
+                      continue
 
-              if matches:
-                  declaration_count += 1
-                  report(
-                      f"KernelSU hook declarations: {path}",
-                      "\n".join(matches) + "\n\n" + text[:12000]
-                  )
+                  if path.suffix not in source_extensions:
+                      continue
 
-          if declaration_count == 0:
-              report(
-                  "KernelSU hook declarations",
-                  "No matching handler declarations found in header files."
+                  try:
+                      lines = path.read_text(
+                          errors="replace"
+                      ).splitlines()
+                  except OSError:
+                      continue
+
+                  for number, line in enumerate(lines):
+                      matched = [
+                          symbol for symbol in symbols
+                          if symbol in line
+                      ]
+
+                      if not matched:
+                          continue
+
+                      matches_found += 1
+                      start = max(0, number - 7)
+                      end = min(len(lines), number + 13)
+
+                      section(
+                          f"KERNELSU SYMBOL: {path}:{number + 1}",
+                          "Matched: " + ", ".join(matched) + "\n\n"
+                          + "\n".join(
+                              f"{i + 1}: {lines[i]}"
+                              for i in range(start, end)
+                          )
+                      )
+
+          if matches_found == 0:
+              section(
+                  "KERNELSU SYMBOL SEARCH",
+                  "No matching handler symbols found."
               )
 
-          report(
-              "AUDIT RESULT",
-              "Source inspection completed. No kernel source files were "
-              "patched by this audit."
+          section(
+              "AUDIT COMPLETION",
+              "Inspection finished. No kernel source files were modified."
           )
 
-          Path("kernelsu-source-audit.txt").write_text(
-              "\n".join(output) + "\n"
+          Path("kernelsu-hook-implementation-audit.txt").write_text(
+              "\n".join(report) + "\n"
           )
 
-          print("Source audit completed.")
-          print("Report saved as kernelsu-source-audit.txt")
+          print("KernelSU hook implementation audit completed.")
+          print("Report: kernelsu-hook-implementation-audit.txt")
           PY
 
-      - name: Upload source audit report
-        uses: actions/upload-artifact@v4
+      - name: Upload detailed audit report
+        uses: actions/upload-artifact@v6
         with:
-          name: oneplus5-kernelsu-source-audit
-          path: kernelsu-source-audit.txt
+          name: oneplus5-kernelsu-hook-audit
+          path: kernelsu-hook-implementation-audit.txt
           if-no-files-found: error
